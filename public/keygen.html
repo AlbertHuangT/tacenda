@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Identity Key Generator — RSA Encrypted Chat</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Courier New', monospace;
+      background: #0d0d0d;
+      color: #888;
+      line-height: 1.75;
+      padding: 56px 24px 80px;
+    }
+
+    .wrap {
+      max-width: 620px;
+      margin: 0 auto;
+    }
+
+    .back {
+      display: inline-block;
+      font-size: 0.62rem;
+      color: #333;
+      text-decoration: none;
+      letter-spacing: 0.08em;
+      margin-bottom: 28px;
+      transition: color 0.15s;
+    }
+    .back:hover { color: #555; }
+
+    h1 {
+      font-size: 0.78rem;
+      font-weight: normal;
+      letter-spacing: 0.16em;
+      color: #d0d0d0;
+      text-transform: uppercase;
+      margin-bottom: 8px;
+    }
+
+    .sub {
+      font-size: 0.72rem;
+      color: #3a3a3a;
+      letter-spacing: 0.06em;
+      margin-bottom: 44px;
+    }
+
+    hr {
+      border: none;
+      border-top: 1px solid #181818;
+      margin: 32px 0;
+    }
+
+    h2 {
+      font-size: 0.65rem;
+      font-weight: normal;
+      letter-spacing: 0.18em;
+      color: #444;
+      text-transform: uppercase;
+      margin-bottom: 16px;
+    }
+
+    p {
+      font-size: 0.8rem;
+      color: #686868;
+      margin-bottom: 14px;
+    }
+
+    em {
+      font-style: normal;
+      color: #b0b0b0;
+    }
+
+    /* ── Generate button ── */
+    #generateBtn {
+      background: #0a150a;
+      color: #6fcf6f;
+      border: 1px solid #1e3a1e;
+      border-radius: 4px;
+      padding: 10px 26px;
+      font-family: inherit;
+      font-size: 0.8rem;
+      letter-spacing: 0.08em;
+      cursor: pointer;
+      transition: background 0.15s, border-color 0.15s, color 0.15s;
+      margin-bottom: 28px;
+    }
+    #generateBtn:hover:not(:disabled) {
+      background: #0f1f0f;
+      border-color: #2a5a2a;
+      color: #88df88;
+    }
+    #generateBtn:disabled {
+      opacity: 0.4;
+      cursor: default;
+    }
+
+    /* ── Result panels ── */
+    .result-panel {
+      display: none;
+    }
+    .result-panel.visible {
+      display: block;
+    }
+
+    .field-label {
+      font-size: 0.62rem;
+      color: #3a3a3a;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      margin-bottom: 8px;
+    }
+
+    textarea {
+      width: 100%;
+      background: #0f0f0f;
+      color: #5b9bd5;
+      border: 1px solid #1a1a1a;
+      border-radius: 4px;
+      padding: 10px 12px;
+      font-family: inherit;
+      font-size: 0.7rem;
+      resize: none;
+      line-height: 1.5;
+      margin-bottom: 10px;
+    }
+    textarea:focus { outline: none; border-color: #2a3a4a; }
+    textarea[readonly] { color: #5b9bd5; cursor: default; }
+
+    .btn-row {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 28px;
+      flex-wrap: wrap;
+    }
+
+    button.action {
+      background: #141414;
+      color: #999;
+      border: 1px solid #2a2a2a;
+      border-radius: 4px;
+      padding: 7px 16px;
+      font-family: inherit;
+      font-size: 0.75rem;
+      cursor: pointer;
+      letter-spacing: 0.04em;
+      transition: background 0.15s, color 0.15s;
+    }
+    button.action:hover { background: #1e1e1e; color: #ccc; }
+
+    button.action.primary {
+      background: #0a150a;
+      color: #6fcf6f;
+      border-color: #1e3a1e;
+    }
+    button.action.primary:hover { background: #0f1f0f; border-color: #2a5a2a; }
+
+    /* ── Warning box ── */
+    .warning {
+      background: #110a0a;
+      border: 1px solid #2a1a1a;
+      border-radius: 4px;
+      padding: 12px 16px;
+      margin-bottom: 20px;
+    }
+
+    .warning p {
+      color: #6a3a3a;
+      font-size: 0.75rem;
+      margin-bottom: 0;
+    }
+
+    .warning strong {
+      color: #9a5a5a;
+      font-weight: normal;
+    }
+
+    /* ── Status message ── */
+    #status {
+      font-size: 0.72rem;
+      color: #444;
+      margin-bottom: 20px;
+      min-height: 1.2em;
+    }
+    #status.ok  { color: #4a8a4a; }
+    #status.err { color: #8a4a4a; }
+
+    .note {
+      font-size: 0.72rem;
+      color: #383838;
+      padding: 10px 14px;
+      border-left: 2px solid #181818;
+      margin-top: 8px;
+    }
+
+    .footer {
+      font-size: 0.64rem;
+      color: #242424;
+      letter-spacing: 0.1em;
+      margin-top: 52px;
+    }
+  </style>
+</head>
+<body>
+<div class="wrap">
+
+  <a href="/" class="back">← rsa-chat</a>
+
+  <h1>Identity Key Generator</h1>
+  <p class="sub">generate a persistent RSA-2048 key pair for long-term identity</p>
+
+  <hr />
+
+  <h2>Before you generate</h2>
+
+  <p>
+    An identity key pair is <em>optional</em>. It lets you establish recurring contact
+    with someone without exchanging fresh public keys every session.
+  </p>
+
+  <p>
+    Your long-term <em>public key</em> is your identity. Share it with contacts once,
+    offline. Your long-term <em>private key</em> must be kept safe — anyone who
+    obtains it can impersonate you and intercept handshakes addressed to you.
+  </p>
+
+  <div class="warning">
+    <p>
+      <strong>Note:</strong> this page generates keys inside your browser using the
+      Web Crypto API. JavaScript is delivered by the server — a compromised server
+      could theoretically intercept the key before it is downloaded. For higher
+      assurance, use the CLI instead: <strong>./rsa-chat-cli --keygen</strong>
+    </p>
+  </div>
+
+  <hr />
+
+  <h2>Generate</h2>
+
+  <div id="status"></div>
+
+  <button id="generateBtn" onclick="generate()">generate key pair</button>
+
+  <!-- Public key result -->
+  <div id="pubPanel" class="result-panel">
+    <p class="field-label">Your long-term public key &nbsp;—&nbsp; share this with contacts</p>
+    <textarea id="pubKeyOut" rows="5" readonly></textarea>
+    <div class="btn-row">
+      <button class="action" onclick="copyPub()">copy public key</button>
+    </div>
+  </div>
+
+  <!-- Private key result -->
+  <div id="privPanel" class="result-panel">
+    <p class="field-label">Private key &nbsp;—&nbsp; download and store securely, never share</p>
+    <textarea id="privKeyOut" rows="10" readonly></textarea>
+    <div class="btn-row">
+      <button class="action primary" onclick="downloadPriv()">download identity.pem</button>
+    </div>
+
+    <p class="note">
+      Save <code>identity.pem</code> somewhere only you can access. Do not upload it
+      anywhere. If you lose it, generate a new pair and inform your contacts.
+    </p>
+  </div>
+
+  <hr />
+
+  <h2>After generating</h2>
+
+  <p>
+    Share your public key with each contact once — in person, over Signal, or any
+    channel you trust. They will use it to address encrypted handshakes to you.
+  </p>
+
+  <p>
+    To use your identity key, run the CLI:
+  </p>
+
+  <pre style="background:#0f0f0f;border:1px solid #1a1a1a;border-radius:5px;padding:16px 18px;font-size:0.78rem;color:#7ec8e3;line-height:1.8;margin-bottom:16px;overflow-x:auto;"><code>./rsa-chat-cli --key identity.pem --server wss://ppb1s0n.us.kg/ws</code></pre>
+
+  <hr />
+
+  <p class="footer">private key never transmitted &nbsp;·&nbsp; generated locally in your browser</p>
+
+</div>
+<script>
+function ab2b64(buf) {
+  return btoa(String.fromCharCode(...new Uint8Array(buf)));
+}
+
+// Format a base64 string into PEM with 64-char line wrapping
+function toPEM(b64, label) {
+  const lines = b64.match(/.{1,64}/g).join("\n");
+  return `-----BEGIN ${label}-----\n${lines}\n-----END ${label}-----`;
+}
+
+let privPEM = null;
+
+async function generate() {
+  const btn = document.getElementById("generateBtn");
+  btn.disabled = true;
+  setStatus("generating RSA-2048 key pair…", "");
+
+  try {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "RSA-OAEP", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
+      true,
+      ["encrypt", "decrypt"]
+    );
+
+    // Export public key → SPKI base64 (same format as the chat client)
+    const spkiBuf = await crypto.subtle.exportKey("spki", keyPair.publicKey);
+    const pubB64  = ab2b64(spkiBuf);
+
+    // Export private key → PKCS#8 PEM (compatible with Go CLI and OpenSSL)
+    const pkcs8Buf = await crypto.subtle.exportKey("pkcs8", keyPair.privateKey);
+    const privB64  = ab2b64(pkcs8Buf);
+    privPEM = toPEM(privB64, "PRIVATE KEY");
+
+    document.getElementById("pubKeyOut").value  = pubB64;
+    document.getElementById("privKeyOut").value = privPEM;
+
+    document.getElementById("pubPanel").classList.add("visible");
+    document.getElementById("privPanel").classList.add("visible");
+
+    setStatus("key pair generated.", "ok");
+  } catch (e) {
+    setStatus("generation failed: " + e.message, "err");
+    btn.disabled = false;
+  }
+}
+
+async function copyPub() {
+  const val = document.getElementById("pubKeyOut").value;
+  await navigator.clipboard.writeText(val);
+  const btn = event.target;
+  btn.textContent = "copied!";
+  setTimeout(() => (btn.textContent = "copy public key"), 1800);
+}
+
+function downloadPriv() {
+  if (!privPEM) return;
+  const blob = new Blob([privPEM], { type: "application/x-pem-file" });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement("a");
+  a.href     = url;
+  a.download = "identity.pem";
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function setStatus(msg, cls) {
+  const el = document.getElementById("status");
+  el.textContent = msg;
+  el.className = cls;
+}
+</script>
+</body>
+</html>

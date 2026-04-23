@@ -55,6 +55,20 @@ export class ChatRoom {
       // Tag this socket with the client's public key (their routing address)
       ws.serializeAttachment({ publicKey: msg.publicKey });
 
+    } else if (msg.type === "handshake_broadcast" &&
+               typeof msg.payload === "string" &&
+               typeof msg.senderSession === "string") {
+      // Broadcast to all connected sockets except the sender — server never reads payload
+      if (msg.payload.length > 512 || msg.senderSession.length > 512) return;
+      const outbound = JSON.stringify({
+        type: "handshake_broadcast",
+        payload: msg.payload,
+        senderSession: msg.senderSession,
+      });
+      for (const socket of this.state.getWebSockets()) {
+        if (socket !== ws) socket.send(outbound);
+      }
+
     } else if (msg.type === "message" && typeof msg.to === "string") {
       // Walk all live sockets to find the recipient
       const sockets = this.state.getWebSockets();

@@ -7,17 +7,29 @@ const WebSocket = require("ws");
 // In-memory only — nothing persists, disconnect removes the entry immediately
 const clients = new Map();
 
-// ── HTTP server: serves index.html ────────────────────────────────────────────
+// ── HTTP server: serves static pages from ./public ───────────────────────────
+const PUBLIC = path.join(__dirname, "public");
+
+// Map clean URL paths to filenames in ./public
+const ROUTES = {
+  "/":           "index.html",
+  "/index.html": "index.html",
+  "/chat":       "chat.html",
+  "/chat.html":  "chat.html",
+  "/keygen":     "keygen.html",
+  "/keygen.html":"keygen.html",
+};
+
 const server = http.createServer((req, res) => {
-  if (req.method === "GET" && (req.url === "/" || req.url === "/index.html")) {
-    fs.readFile(path.join(__dirname, "index.html"), (err, data) => {
-      if (err) { res.writeHead(500); res.end("error"); return; }
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      res.end(data);
-    });
-  } else {
-    res.writeHead(404); res.end("not found");
-  }
+  if (req.method !== "GET") { res.writeHead(405); res.end(); return; }
+  const { pathname } = new URL(req.url, "http://localhost");
+  const file = ROUTES[pathname];
+  if (!file) { res.writeHead(404); res.end("not found"); return; }
+  fs.readFile(path.join(PUBLIC, file), (err, data) => {
+    if (err) { res.writeHead(404); res.end("not found"); return; }
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(data);
+  });
 });
 
 // ── WebSocket server on /ws ───────────────────────────────────────────────────
@@ -43,6 +55,21 @@ wss.on("connection", function (ws) {
       registeredKey = msg.publicKey;
       clients.set(registeredKey, ws);
       console.log(`client registered  (${clients.size} online)`);
+
+    } else if (msg.type === "handshake_broadcast" &&
+               typeof msg.payload === "string" &&
+               typeof msg.senderSession === "string") {
+      if (msg.payload.length > 512 || msg.senderSession.length > 512) return;
+      const outbound = JSON.stringify({
+        type: "handshake_broadcast",
+        payload: msg.payload,
+        senderSession: msg.senderSession,
+      });
+      wss.clients.forEach(client => {
+        if (client !== ws && client.readyState === WebSocket.OPEN) {
+          client.send(outbound);
+        }
+      });
 
     } else if (msg.type === "message" && typeof msg.to === "string") {
       const recipientWs = clients.get(msg.to);
