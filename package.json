@@ -1,16 +1,18 @@
 {
-  "name": "rsa-char",
+  "name": "rsa-chat",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Zero-storage, fully anonymous, end-to-end RSA-encrypted chat",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "start": "node server.js"
   },
-  "keywords": [],
-  "author": "",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
     "ws": "^8.20.0"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
   }
 }

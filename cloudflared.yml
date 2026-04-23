@@ -1,0 +1,12 @@
+# Cloudflare Tunnel configuration
+# Generated after running: cloudflared tunnel create rsa-chat
+#
+# Replace the values below with your actual tunnel ID and domain.
+
+tunnel: a891812c-f808-4688-a9b2-f33250b8f346
+credentials-file: /Users/albert/.cloudflared/a891812c-f808-4688-a9b2-f33250b8f346.json
+
+ingress:
+  - hostname: ppb1s0n.us.kg
+    service: http://localhost:3000
+  - service: http_status:404
