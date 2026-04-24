@@ -52,14 +52,18 @@ wss.on("connection", function (ws) {
     try { msg = JSON.parse(data); } catch { return; }
 
     if (msg.type === "register" && typeof msg.publicKey === "string") {
+      if (registeredKey && registeredKey !== msg.publicKey) {
+        clients.delete(registeredKey);
+      }
       registeredKey = msg.publicKey;
       clients.set(registeredKey, ws);
       console.log(`client registered  (${clients.size} online)`);
 
     } else if (msg.type === "handshake_broadcast" &&
-               typeof msg.payload === "string" &&
+               msg.payload != null &&
                typeof msg.senderSession === "string") {
-      if (msg.payload.length > 512 || msg.senderSession.length > 512) return;
+      const payloadStr = typeof msg.payload === "string" ? msg.payload : JSON.stringify(msg.payload);
+      if (payloadStr.length > 2048 || msg.senderSession.length > 512) return;
       const outbound = JSON.stringify({
         type: "handshake_broadcast",
         payload: msg.payload,

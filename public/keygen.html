@@ -226,6 +226,27 @@
     obtains it can impersonate you and intercept handshakes addressed to you.
   </p>
 
+  <div class="warning" style="background:#11100a;border-color:#2a2618;">
+    <p style="color:#6a6030;margin-bottom:8px;">
+      <strong style="color:#9a8a40;">⚠ Key = Identity:</strong> your public key is your
+      <em>only</em> identifier in this system. There are no usernames, no emails,
+      no account recovery. Contacts address messages to your public key — it <em>is</em>
+      your address.
+    </p>
+    <p style="color:#6a6030;margin-bottom:8px;">
+      If you generate a new key pair for any reason, you effectively create a
+      <em>new identity</em>. All existing contact relationships become <em>one-way</em>:
+      you can still send messages to anyone whose public key you have, but they will
+      be unable to reach you — their messages will be addressed to your old key,
+      which no longer exists.
+    </p>
+    <p style="color:#6a6030;margin-bottom:0;">
+      This remains broken until <em>you</em> proactively contact each person and share
+      your new public key. Treat key generation as irreversible — back up your
+      private key carefully.
+    </p>
+  </div>
+
   <div class="warning">
     <p>
       <strong>Note:</strong> this page generates keys inside your browser using the
@@ -248,7 +269,7 @@
     <p class="field-label">Your long-term public key &nbsp;—&nbsp; share this with contacts</p>
     <textarea id="pubKeyOut" rows="5" readonly></textarea>
     <div class="btn-row">
-      <button class="action" onclick="copyPub()">copy public key</button>
+      <button class="action" onclick="copyPub(this)">copy public key</button>
     </div>
   </div>
 
@@ -279,7 +300,7 @@
     To use your identity key, run the CLI:
   </p>
 
-  <pre style="background:#0f0f0f;border:1px solid #1a1a1a;border-radius:5px;padding:16px 18px;font-size:0.78rem;color:#7ec8e3;line-height:1.8;margin-bottom:16px;overflow-x:auto;"><code>./rsa-chat-cli --key identity.pem --server wss://ppb1s0n.us.kg/ws</code></pre>
+  <pre style="background:#0f0f0f;border:1px solid #1a1a1a;border-radius:5px;padding:16px 18px;font-size:0.78rem;color:#7ec8e3;line-height:1.8;margin-bottom:16px;overflow-x:auto;"><code>./rsa-chat-cli --key identity.pem --server wss://your-server/ws</code></pre>
 
   <hr />
 
@@ -333,10 +354,9 @@ async function generate() {
   }
 }
 
-async function copyPub() {
+async function copyPub(btn) {
   const val = document.getElementById("pubKeyOut").value;
   await navigator.clipboard.writeText(val);
-  const btn = event.target;
   btn.textContent = "copied!";
   setTimeout(() => (btn.textContent = "copy public key"), 1800);
 }

@@ -81,16 +81,17 @@ cd cli && go build -o rsa-chat-cli .
 # generate a long-term identity key pair (run once)
 ./rsa-chat-cli --keygen --out ~/.rsa-chat/identity.pem
 
-# connect
+# connect (if --key is omitted, auto-discovers ~/.rsa-chat/identity.pem)
 ./rsa-chat-cli --key ~/.rsa-chat/identity.pem \
                --server wss://ppb1s0n.us.kg/ws
 
 # commands
 /find <long_term_public_key>   broadcast a handshake to a contact
 /accept <n>                    accept an incoming handshake
+/chat <n>                      switch active contact (alias for /accept)
 /contacts                      list known contacts
-/chat <n>                      switch active contact
 /mykey                         print your current session public key
+/help                          show available commands
 /quit                          exit
 ```
 
