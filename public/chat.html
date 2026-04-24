@@ -214,9 +214,14 @@ async function init() {
   };
 
   ws.onmessage = (event) => {
-    const msg = JSON.parse(event.data);
+    let msg;
+    try { msg = JSON.parse(event.data); } catch { return; }
     if (msg.type === "message") handleIncoming(msg);
     else if (msg.type === "error") addSystem("⚠ " + msg.message);
+  };
+
+  ws.onerror = () => {
+    addSystem("⚠ connection error — check your network.");
   };
 
   ws.onclose = () => {

@@ -211,34 +211,28 @@ func handleHandshake(msg IncomingMessage) {
 		return
 	}
 
-	// payload is a JSON string containing base64-encoded ciphertext
-	var payloadB64 string
-	if err := json.Unmarshal(msg.Payload, &payloadB64); err != nil {
+	// payload is a hybrid-encrypted { k, iv, msg } object (same format as chat messages)
+	var payload ChatPayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 		return
 	}
 
-	encBytes, err := base64.StdEncoding.DecodeString(payloadB64)
-	if err != nil {
-		return
-	}
-
-	// Attempt RSA-OAEP decryption — fails silently if not addressed to us
-	sessionKeyBytes, err := rsa.DecryptOAEP(sha256.New(), rand.Reader, identityPrivKey, encBytes, nil)
+	// Attempt hybrid decryption — fails silently if not addressed to us
+	sessionKeyRaw, err := decryptMessage(identityPrivKey, &payload)
 	if err != nil {
 		return // not for us
 	}
 
-	// Integrity check: decrypted bytes should be the sender's session public key
-	sessionKeyB64 := base64.StdEncoding.EncodeToString(sessionKeyBytes)
+	// sessionKeyRaw is the raw SPKI DER bytes of the sender's session public key
+	sessionKeyB64 := base64.StdEncoding.EncodeToString([]byte(sessionKeyRaw))
+
+	// Integrity check: should match the plaintext senderSession field
 	if sessionKeyB64 != msg.SenderSession {
 		return
 	}
 
 	// Parse the session public key
-	spkiBytes, err := base64.StdEncoding.DecodeString(sessionKeyB64)
-	if err != nil {
-		return
-	}
+	spkiBytes := []byte(sessionKeyRaw)
 	pubKeyIface, err := x509.ParsePKIXPublicKey(spkiBytes)
 	if err != nil {
 		return
@@ -441,16 +435,18 @@ func broadcastHandshake(friendLongTermPubB64 string) error {
 		return fmt.Errorf("not an RSA key")
 	}
 
-	// Encrypt MY session public key bytes with FRIEND's long-term public key
+	// Encrypt MY session public key bytes with FRIEND's long-term public key.
+	// Session public key SPKI is 294 bytes — exceeds RSA-OAEP's 190-byte limit,
+	// so we use hybrid encryption (same AES-GCM + RSA-OAEP scheme as chat messages).
 	sessionPubKeyBytes, _ := base64.StdEncoding.DecodeString(sessionPubKeyB64)
-	encrypted, err := rsa.EncryptOAEP(sha256.New(), rand.Reader, friendPubKey, sessionPubKeyBytes, nil)
+	payload, err := encryptMessage(friendPubKey, string(sessionPubKeyBytes))
 	if err != nil {
 		return fmt.Errorf("encryption failed: %w", err)
 	}
 
 	return sendJSON(map[string]any{
 		"type":          "handshake_broadcast",
-		"payload":       base64.StdEncoding.EncodeToString(encrypted),
+		"payload":       payload,
 		"senderSession": sessionPubKeyB64,
 	})
 }
