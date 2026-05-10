@@ -1,5 +1,5 @@
 {
-  "name": "rsa-chat",
+  "name": "tacenda",
   "version": "1.0.0",
   "description": "Zero-storage, fully anonymous, end-to-end RSA-encrypted chat",
   "scripts": {

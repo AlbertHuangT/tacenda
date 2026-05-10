@@ -79,9 +79,9 @@ func main() {
 	}
 
 	if *keyPath == "" {
-		// Try default path ~/rsa-chat/identity.pem
+		// Try default path ~/.tacenda/identity.pem
 		home, _ := os.UserHomeDir()
-		defaultPath := filepath.Join(home, ".rsa-chat", "identity.pem")
+		defaultPath := filepath.Join(home, ".tacenda", "identity.pem")
 		if _, err := os.Stat(defaultPath); err == nil {
 			*keyPath = defaultPath
 		}

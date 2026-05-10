@@ -96,5 +96,5 @@ wss.on("connection", function (ws) {
 // ── Listen ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`RSA chat server → http://localhost:${PORT}`);
+  console.log(`Tacenda server → http://localhost:${PORT}`);
 });

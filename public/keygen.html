@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Identity Key Generator — RSA Encrypted Chat</title>
+  <title>Identity Key Generator — Tacenda</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -206,7 +206,7 @@
 <body>
 <div class="wrap">
 
-  <a href="/" class="back">← rsa-chat</a>
+  <a href="/" class="back">← Tacenda</a>
 
   <h1>Identity Key Generator</h1>
   <p class="sub">generate a persistent RSA-2048 key pair for long-term identity</p>
@@ -231,7 +231,7 @@
       <strong>Note:</strong> this page generates keys inside your browser using the
       Web Crypto API. JavaScript is delivered by the server — a compromised server
       could theoretically intercept the key before it is downloaded. For higher
-      assurance, use the CLI instead: <strong>./rsa-chat-cli --keygen</strong>
+      assurance, use the CLI instead: <strong>./tacenda-cli --keygen</strong>
     </p>
   </div>
 
@@ -279,7 +279,7 @@
     To use your identity key, run the CLI:
   </p>
 
-  <pre style="background:#0f0f0f;border:1px solid #1a1a1a;border-radius:5px;padding:16px 18px;font-size:0.78rem;color:#7ec8e3;line-height:1.8;margin-bottom:16px;overflow-x:auto;"><code>./rsa-chat-cli --key identity.pem --server wss://ppb1s0n.us.kg/ws</code></pre>
+  <pre style="background:#0f0f0f;border:1px solid #1a1a1a;border-radius:5px;padding:16px 18px;font-size:0.78rem;color:#7ec8e3;line-height:1.8;margin-bottom:16px;overflow-x:auto;"><code>./tacenda-cli --key identity.pem --server wss://ppb1s0n.us.kg/ws</code></pre>
 
   <hr />
 

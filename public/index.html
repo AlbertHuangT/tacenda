@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>RSA Encrypted Chat</title>
+  <title>Tacenda</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -157,7 +157,7 @@
 <body>
 <div class="wrap">
 
-  <h1 class="site-title">RSA Encrypted Chat</h1>
+  <h1 class="site-title">Tacenda</h1>
   <p class="tagline">end-to-end encrypted &nbsp;·&nbsp; zero server-side state &nbsp;·&nbsp; no accounts</p>
 
   <hr />
@@ -241,13 +241,13 @@
   <h2>CLI</h2>
 
   <pre><code><span class="cmt"># build from source</span>
-cd cli && go build -o rsa-chat-cli .
+cd cli && go build -o tacenda-cli .
 
 <span class="cmt"># generate a long-term identity key pair (run once, keep the file safe)</span>
-./rsa-chat-cli --keygen --out ~/.rsa-chat/identity.pem
+./tacenda-cli --keygen --out ~/.tacenda/identity.pem
 
 <span class="cmt"># connect to the server</span>
-./rsa-chat-cli --key ~/.rsa-chat/identity.pem \
+./tacenda-cli --key ~/.tacenda/identity.pem \
                --server wss://ppb1s0n.us.kg/ws
 
 <span class="cmt"># find a contact — paste their long-term public key</span>

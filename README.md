@@ -1,6 +1,8 @@
-# RSA Encrypted Chat
+# Tacenda
 
 End-to-end encrypted messaging with zero server-side state. No accounts, no logs, no persistent storage of any kind.
+
+> *Tacenda* — Latin, "things to be kept silent."
 
 **Live:** [ppb1s0n.us.kg](https://ppb1s0n.us.kg)
 
@@ -76,13 +78,13 @@ The Go CLI client supports long-term identity keys and background operation.
 
 ```bash
 # build
-cd cli && go build -o rsa-chat-cli .
+cd cli && go build -o tacenda-cli .
 
 # generate a long-term identity key pair (run once)
-./rsa-chat-cli --keygen --out ~/.rsa-chat/identity.pem
+./tacenda-cli --keygen --out ~/.tacenda/identity.pem
 
 # connect
-./rsa-chat-cli --key ~/.rsa-chat/identity.pem \
+./tacenda-cli --key ~/.tacenda/identity.pem \
                --server wss://ppb1s0n.us.kg/ws
 
 # commands
