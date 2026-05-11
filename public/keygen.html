@@ -323,20 +323,20 @@ let privPEM = null;
 async function generate() {
   const btn = document.getElementById("generateBtn");
   btn.disabled = true;
-  setStatus("generating RSA-2048 key pair…", "");
+  setStatus("generating X25519 key pair…", "");
 
   try {
     const keyPair = await crypto.subtle.generateKey(
-      { name: "RSA-OAEP", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
+      { name: "X25519" },
       true,
-      ["encrypt", "decrypt"]
+      ["deriveBits"]
     );
 
-    // Export public key → SPKI base64 (same format as the chat client)
-    const spkiBuf = await crypto.subtle.exportKey("spki", keyPair.publicKey);
-    const pubB64  = ab2b64(spkiBuf);
+    // Public key → raw 32 bytes → base64 (44 chars, same format as the chat client)
+    const rawPub = await crypto.subtle.exportKey("raw", keyPair.publicKey);
+    const pubB64 = ab2b64(rawPub);
 
-    // Export private key → PKCS#8 PEM (compatible with Go CLI and OpenSSL)
+    // Private key → PKCS#8 PEM (RFC 8410 format, readable by Go's crypto/x509 ParsePKCS8PrivateKey)
     const pkcs8Buf = await crypto.subtle.exportKey("pkcs8", keyPair.privateKey);
     const privB64  = ab2b64(pkcs8Buf);
     privPEM = toPEM(privB64, "PRIVATE KEY");
