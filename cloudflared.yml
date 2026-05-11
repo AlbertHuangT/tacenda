@@ -1,5 +1,5 @@
 # Cloudflare Tunnel configuration
-# Generated after running: cloudflared tunnel create rsa-chat
+# Generated after running: cloudflared tunnel create tacenda
 #
 # Replace the values below with your actual tunnel ID and domain.
 

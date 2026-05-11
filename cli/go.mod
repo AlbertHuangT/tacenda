@@ -1,4 +1,4 @@
-module rsa-chat-cli
+module tacenda-cli
 
 go 1.21
 
