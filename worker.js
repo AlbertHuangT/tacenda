@@ -56,10 +56,11 @@ export class ChatRoom {
       ws.serializeAttachment({ publicKey: msg.publicKey });
 
     } else if (msg.type === "handshake_broadcast" &&
-               typeof msg.payload === "string" &&
+               msg.payload != null &&
                typeof msg.senderSession === "string") {
       // Broadcast to all connected sockets except the sender — server never reads payload
-      if (msg.payload.length > 512 || msg.senderSession.length > 512) return;
+      const payloadStr = typeof msg.payload === "string" ? msg.payload : JSON.stringify(msg.payload);
+      if (payloadStr.length > 2048 || msg.senderSession.length > 512) return;
       const outbound = JSON.stringify({
         type: "handshake_broadcast",
         payload: msg.payload,

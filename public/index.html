@@ -231,6 +231,29 @@
 
   <hr />
 
+  <h2>Limitations</h2>
+
+  <p>
+    The server sees <em>routing metadata</em>: which public key is sending to which
+    public key, and when. It cannot read message content, but it can observe traffic
+    patterns — who talks to whom and how often.
+  </p>
+
+  <p>
+    There is no <em>sender authentication</em> in the ephemeral web chat. Anyone who
+    obtains your contact's public key can send messages that appear to come from a new
+    conversation partner. The CLI's handshake protocol mitigates this for identity-key
+    users.
+  </p>
+
+  <p>
+    Web clients execute JavaScript delivered by the server at page load. A compromised
+    server could serve modified code that exfiltrates keys. The CLI binary is auditable,
+    static, and immune to that class of attack.
+  </p>
+
+  <hr />
+
   <div class="nav">
     <a href="/chat">open chat →</a>
     <a href="/keygen">generate identity key →</a>
@@ -246,7 +269,7 @@ cd cli && go build -o tacenda-cli .
 <span class="cmt"># generate a long-term identity key pair (run once, keep the file safe)</span>
 ./tacenda-cli --keygen --out ~/.tacenda/identity.pem
 
-<span class="cmt"># connect to the server</span>
+<span class="cmt"># connect to the server (replace URL with your own if self-hosting)</span>
 ./tacenda-cli --key ~/.tacenda/identity.pem \
                --server wss://ppb1s0n.us.kg/ws
 
@@ -264,7 +287,7 @@ cd cli && go build -o tacenda-cli .
 
   <hr />
 
-  <p class="footer">zero storage &nbsp;·&nbsp; keys destroyed on disconnect &nbsp;·&nbsp; server reads no plaintext</p>
+  <p class="footer">zero storage &nbsp;·&nbsp; no cookies &nbsp;·&nbsp; no analytics &nbsp;·&nbsp; no tracking &nbsp;·&nbsp; keys destroyed on disconnect &nbsp;·&nbsp; server reads no plaintext</p>
 
 </div>
 </body>

@@ -1,6 +1,7 @@
 node_modules/
 logs/
 .DS_Store
+cli/tacenda-cli
 cli/rsa-chat-cli
 .agents/
 .claude/
