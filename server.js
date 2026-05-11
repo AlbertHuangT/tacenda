@@ -3,14 +3,13 @@ const fs   = require("fs");
 const path = require("path");
 const WebSocket = require("ws");
 
-// Routing table: publicKey (base64 SPKI) -> WebSocket connection
-// In-memory only — nothing persists, disconnect removes the entry immediately
-const clients = new Map();
+// Anonymous broadcast room: server forwards every well-formed JSON envelope to
+// all other connected sockets. No routing table, no recipient lookup, no
+// per-client state. Clients use Double Ratchet + trial-decrypt to find their
+// own messages and ECIES sealed-box handshakes to bootstrap each conversation.
 
-// ── HTTP server: serves static pages from ./public ───────────────────────────
 const PUBLIC = path.join(__dirname, "public");
 
-// Map clean URL paths to filenames in ./public
 const ROUTES = {
   "/":           "index.html",
   "/index.html": "index.html",
@@ -32,7 +31,6 @@ const server = http.createServer((req, res) => {
   });
 });
 
-// ── WebSocket server on /ws ───────────────────────────────────────────────────
 const wss = new WebSocket.Server({ noServer: true });
 
 server.on("upgrade", (request, socket, head) => {
@@ -44,60 +42,31 @@ server.on("upgrade", (request, socket, head) => {
   }
 });
 
+const MAX_FRAME = 8192; // generous for ratchet headers; tightened to 1024 in Phase 3
+
 wss.on("connection", function (ws) {
-  let registeredKey = null;
+  console.log(`client joined  (${wss.clients.size} online)`);
 
   ws.on("message", function (data) {
+    if (data.length > MAX_FRAME) return;
+    const text = data.toString();
+    // Light shape check so random TCP traffic doesn't get fanned out
     let msg;
-    try { msg = JSON.parse(data); } catch { return; }
+    try { msg = JSON.parse(text); } catch { return; }
+    if (msg.type !== "message" && msg.type !== "handshake_broadcast") return;
 
-    if (msg.type === "register" && typeof msg.publicKey === "string") {
-      if (registeredKey && registeredKey !== msg.publicKey) {
-        clients.delete(registeredKey);
-      }
-      registeredKey = msg.publicKey;
-      clients.set(registeredKey, ws);
-      console.log(`client registered  (${clients.size} online)`);
-
-    } else if (msg.type === "handshake_broadcast" &&
-               msg.payload != null &&
-               typeof msg.senderSession === "string") {
-      const payloadStr = typeof msg.payload === "string" ? msg.payload : JSON.stringify(msg.payload);
-      if (payloadStr.length > 2048 || msg.senderSession.length > 512) return;
-      const outbound = JSON.stringify({
-        type: "handshake_broadcast",
-        payload: msg.payload,
-        senderSession: msg.senderSession,
-      });
-      wss.clients.forEach(client => {
-        if (client !== ws && client.readyState === WebSocket.OPEN) {
-          client.send(outbound);
-        }
-      });
-
-    } else if (msg.type === "message" && typeof msg.to === "string") {
-      const recipientWs = clients.get(msg.to);
-      if (recipientWs && recipientWs.readyState === WebSocket.OPEN) {
-        recipientWs.send(JSON.stringify({
-          type: "message",
-          payload: msg.payload,
-          senderKey: msg.senderKey ?? null,
-        }));
-      } else {
-        ws.send(JSON.stringify({ type: "error", message: "recipient not online" }));
+    for (const client of wss.clients) {
+      if (client !== ws && client.readyState === WebSocket.OPEN) {
+        client.send(text);
       }
     }
   });
 
   ws.on("close", () => {
-    if (registeredKey) {
-      clients.delete(registeredKey);
-      console.log(`client left        (${clients.size} online)`);
-    }
+    console.log(`client left    (${wss.clients.size} online)`);
   });
 });
 
-// ── Listen ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`Tacenda server → http://localhost:${PORT}`);

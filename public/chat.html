@@ -187,7 +187,7 @@ let mySessionPubB64   = null;
 let recipientPubRaw   = null;     // Uint8Array(32)
 let recipientPubB64   = null;
 let ratchet           = null;     // active Double Ratchet state
-let firstMessageSent  = false;
+let iInitiated       = false;     // true if user pasted peer's pub (we sent init handshake)
 let ws                = null;
 
 // ─── Base64 helpers ───────────────────────────────────────────────────────────
@@ -209,6 +209,12 @@ function eqU8(a, b) {
   let d = 0;
   for (let i = 0; i < a.length; i++) d |= a[i] ^ b[i];
   return d === 0;
+}
+function cmpU8(a, b) {
+  for (let i = 0; i < Math.min(a.length, b.length); i++) {
+    if (a[i] !== b[i]) return a[i] - b[i];
+  }
+  return a.length - b.length;
 }
 
 // ─── Crypto primitives ────────────────────────────────────────────────────────
@@ -267,6 +273,26 @@ async function aesGcmDec(key32, iv12, ctU8, aadU8) {
 const RK_INFO = "Tacenda/rk/v1";
 const MK_INFO = "Tacenda/mk-mac/v1";
 const INIT_INFO = "Tacenda/init/v1";
+const HS_INFO = "Tacenda/handshake/v1";
+
+// ─── ECIES sealed-box for handshakes ──────────────────────────────────────────
+// Encrypt a 33-byte plaintext ([intent_byte, ...32B session_pub]) to a peer's
+// X25519 public key. Anyone without the matching private key gets a decryption
+// failure and silently drops the message.
+async function ecesEncrypt(recipientPubRaw, plaintextU8) {
+  const eph = await genX25519();
+  const shared = await dh(eph.keyPair.privateKey, recipientPubRaw);
+  const key = await hkdf(shared, new Uint8Array(32), HS_INFO, 32);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await aesGcmEnc(key, iv, plaintextU8);
+  return { eph: ab2b64(eph.pubRaw), iv: ab2b64(iv), ct: ab2b64(ct) };
+}
+async function ecesDecrypt(myPrivKey, payload) {
+  const ephPub = b642u8(payload.eph);
+  const shared = await dh(myPrivKey, ephPub);
+  const key = await hkdf(shared, new Uint8Array(32), HS_INFO, 32);
+  return await aesGcmDec(key, b642u8(payload.iv), b642u8(payload.ct));
+}
 
 async function ratchetInit({ amInitiator, mySessionKP, mySessionPubRaw, peerPubRaw }) {
   const shared = await dh(mySessionKP.privateKey, peerPubRaw);
@@ -400,20 +426,17 @@ async function init() {
   ws = new WebSocket(`${proto}//${location.host}/ws`);
 
   ws.onopen = () => {
-    ws.send(JSON.stringify({ type: "register", publicKey: mySessionPubB64 }));
-    addSystem("connected — your keys are ready. share your public key to start a conversation.");
+    addSystem("connected — share your public key to start a conversation.");
   };
 
   ws.onmessage = (event) => {
     let msg;
     try { msg = JSON.parse(event.data); } catch { return; }
-    if (msg.type === "message") handleIncoming(msg);
-    else if (msg.type === "error") addSystem("⚠ " + msg.message);
+    if (msg.type === "handshake_broadcast") handleHandshake(msg);
+    else if (msg.type === "message") handleMessage(msg);
   };
 
-  ws.onerror = () => {
-    addSystem("⚠ connection error — check your network.");
-  };
+  ws.onerror = () => addSystem("⚠ connection error — check your network.");
 
   ws.onclose = () => {
     addSystem("disconnected — all keys destroyed.");
@@ -422,6 +445,9 @@ async function init() {
   };
 }
 
+// User pasted recipient's pubkey → send init handshake. Ratchet is set up only
+// once we receive the peer's reply handshake (or an init from them, if they're
+// also initiating).
 async function setRecipient(keyB64Override) {
   const raw = (keyB64Override ?? document.getElementById("recipientKey").value).trim();
   if (!raw) return;
@@ -429,95 +455,94 @@ async function setRecipient(keyB64Override) {
   let pubRaw;
   try {
     pubRaw = b642u8(raw);
-    if (pubRaw.length !== 32) throw new Error("X25519 pubkey must be 32 bytes");
-    // Validate by importing
+    if (pubRaw.length !== 32) throw 0;
     await importX25519Pub(pubRaw);
-  } catch (e) {
+  } catch {
     setHint("recipientHint", "invalid key — must be a 32-byte X25519 pubkey (base64)", "err");
     return;
   }
 
   recipientPubRaw = pubRaw;
   recipientPubB64 = raw;
-  firstMessageSent = false;
+  iInitiated = true;
+  ratchet = null;
 
-  // Bootstrap ratchet as initiator (we're about to send). If a message arrives
-  // before we send, handleIncoming will re-init as responder.
-  ratchet = await ratchetInit({
-    amInitiator: true,
-    mySessionKP: mySessionKeyPair,
-    mySessionPubRaw,
-    peerPubRaw: pubRaw,
-  });
+  // Init handshake plaintext = [0x00, my_session_pub (32B)]
+  const plaintext = concatU8(new Uint8Array([0x00]), mySessionPubRaw);
+  const payload = await ecesEncrypt(pubRaw, plaintext);
+  ws.send(JSON.stringify({ type: "handshake_broadcast", payload }));
 
   if (!keyB64Override) document.getElementById("recipientKey").value = raw;
+  setHint("recipientHint", "handshake sent — waiting for recipient to come online", "muted");
+  document.getElementById("msgInput").disabled = true;
+  document.getElementById("sendBtn").disabled = true;
+}
 
-  setHint("recipientHint", "recipient key loaded — messages are forward-secret (Double Ratchet)", "ok");
+async function handleHandshake(msg) {
+  let plaintext;
+  try { plaintext = await ecesDecrypt(mySessionKeyPair.privateKey, msg.payload); }
+  catch { return; } // not for us
+  if (plaintext.length !== 33) return;
+
+  const intent = plaintext[0];
+  const senderSessionPub = plaintext.slice(1, 33);
+  if (ratchet) return; // already in a conversation
+
+  if (intent === 0x00) {
+    // Peer is initiating chat with us. Send reply, then bootstrap.
+    const reply = concatU8(new Uint8Array([0x01]), mySessionPubRaw);
+    const replyPayload = await ecesEncrypt(senderSessionPub, reply);
+    ws.send(JSON.stringify({ type: "handshake_broadcast", payload: replyPayload }));
+
+    // Simultaneous-initiation tie-break: if we also initiated, the side with
+    // greater pubkey becomes initiator (so one side has CKs ready).
+    const amInitiator = iInitiated && cmpU8(mySessionPubRaw, senderSessionPub) > 0;
+
+    recipientPubRaw = senderSessionPub;
+    recipientPubB64 = ab2b64(senderSessionPub);
+    document.getElementById("recipientKey").value = recipientPubB64;
+    ratchet = await ratchetInit({
+      amInitiator, mySessionKP: mySessionKeyPair, mySessionPubRaw,
+      peerPubRaw: senderSessionPub,
+    });
+  } else if (intent === 0x01) {
+    // We initiated; peer is replying with their session_pub.
+    if (!iInitiated) return;
+    recipientPubRaw = senderSessionPub;
+    recipientPubB64 = ab2b64(senderSessionPub);
+    document.getElementById("recipientKey").value = recipientPubB64;
+    ratchet = await ratchetInit({
+      amInitiator: true, mySessionKP: mySessionKeyPair, mySessionPubRaw,
+      peerPubRaw: senderSessionPub,
+    });
+  } else {
+    return;
+  }
+
   document.getElementById("msgInput").disabled = false;
   document.getElementById("sendBtn").disabled = false;
-  document.getElementById("msgInput").focus();
+  setHint("recipientHint", "handshake complete — chat is forward-secret end-to-end", "ok");
+}
+
+async function handleMessage(msg) {
+  if (!ratchet) return; // no conversation set up; silently drop broadcast traffic
+  try {
+    const pt = await ratchetDecrypt(ratchet, msg.payload);
+    addMessage(new TextDecoder().decode(pt), "received");
+  } catch {
+    // Not for us, or ratchet desync — drop silently. This is the normal case
+    // for the majority of broadcast traffic once everyone is on one channel.
+  }
 }
 
 async function sendMessage() {
   const input = document.getElementById("msgInput");
   const text  = input.value.trim();
   if (!text || !ratchet || !ws || ws.readyState !== WebSocket.OPEN) return;
-
-  const ptBytes = new TextEncoder().encode(text);
-  const payload = await ratchetEncrypt(ratchet, ptBytes);
-
-  // Phase 1: always send senderKey so peers can route. Phase 2 (trial-decrypt)
-  // will drop this field along with the `to` field.
-  ws.send(JSON.stringify({
-    type: "message",
-    to: recipientPubB64,
-    payload,
-    senderKey: mySessionPubB64,
-  }));
-
-  firstMessageSent = true;
+  const payload = await ratchetEncrypt(ratchet, new TextEncoder().encode(text));
+  ws.send(JSON.stringify({ type: "message", payload }));
   addMessage(text, "sent");
   input.value = "";
-}
-
-async function handleIncoming(msg) {
-  // First contact from this peer — initialize ratchet as responder using their session pub
-  if (msg.senderKey && !ratchet) {
-    let pubRaw;
-    try {
-      pubRaw = b642u8(msg.senderKey);
-      if (pubRaw.length !== 32) throw new Error("bad pubkey");
-      await importX25519Pub(pubRaw);
-    } catch {
-      addSystem("⚠ incoming message has malformed sender key.");
-      return;
-    }
-    recipientPubRaw = pubRaw;
-    recipientPubB64 = msg.senderKey;
-    document.getElementById("recipientKey").value = msg.senderKey;
-    ratchet = await ratchetInit({
-      amInitiator: false,
-      mySessionKP: mySessionKeyPair,
-      mySessionPubRaw,
-      peerPubRaw: pubRaw,
-    });
-    document.getElementById("msgInput").disabled = false;
-    document.getElementById("sendBtn").disabled = false;
-    setHint("recipientHint", "recipient key auto-loaded from incoming message — you can reply now.", "ok");
-  }
-
-  if (!ratchet) {
-    addSystem("⚠ received message but no ratchet state.");
-    return;
-  }
-
-  try {
-    const ptBytes = await ratchetDecrypt(ratchet, msg.payload);
-    const text = new TextDecoder().decode(ptBytes);
-    addMessage(text, "received");
-  } catch (e) {
-    addSystem("⚠ could not decrypt a message — " + e.message);
-  }
 }
 
 function addMessage(text, type) {
@@ -535,7 +560,7 @@ function setHint(id, text, type) {
   el.className = `hint ${type}`;
 }
 async function copyMyKey() {
-  await navigator.clipboard.writeText(myPublicKeyB64);
+  await navigator.clipboard.writeText(mySessionPubB64);
   const btn = document.getElementById("copyBtn");
   btn.textContent = "copied!";
   setTimeout(() => (btn.textContent = "copy"), 1800);
