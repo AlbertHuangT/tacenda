@@ -27,13 +27,21 @@ Two-file app, no framework, no database, no persistent storage of any kind.
 
 Node.js WebSocket server on port 3000. Maintains one in-memory `Map<publicKeyBase64, WebSocket>` as a routing table — nothing else.
 
-**Protocol (two message types):**
+**Protocol (three message types):**
 - `{ type: "register", publicKey }` — client announces its public key as its address; server adds it to the map
-- `{ type: "message", to, payload, senderKey? }` — server looks up `to` in the map and forwards the envelope verbatim; sends `{ type: "error" }` back if recipient isn't online
+- `{ type: "message", to, payload, senderKey? }` — server looks up `to` in the map and forwards the envelope verbatim; sends `{ type: "error", message }` back if recipient isn't online
+- `{ type: "handshake_broadcast", payload, senderSession }` — server broadcasts to all other connected clients; payload is a hybrid-encrypted blob (object or string), senderSession is the sender's session public key (base64); size-limited to 2048 + 512 bytes
 
 Disconnect removes the entry immediately. Server never reads `payload` content.
 
-### Client (`public/index.html`)
+### Pages
+
+Three pages under `public/`, all inline JS, no dependencies:
+- `public/index.html` — landing page (documentation, links to chat and keygen)
+- `public/chat.html` — chat interface (session key gen, messaging)
+- `public/keygen.html` — identity key generator (long-term RSA key pair)
+
+### Chat Client (`public/chat.html`)
 
 Single HTML file, all JS inline. No dependencies.
 

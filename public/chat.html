@@ -158,7 +158,7 @@
   <div class="panel">
     <label>Your public key &nbsp;—&nbsp; share this with the person you want to chat with</label>
     <div class="row">
-      <textarea id="myKey" rows="3" readonly placeholder="generating RSA-2048 key pair…"></textarea>
+      <textarea id="myKey" rows="3" readonly placeholder="generating X25519 key pair…"></textarea>
       <button id="copyBtn" onclick="copyMyKey()">copy</button>
     </div>
   </div>
@@ -180,36 +180,227 @@
   </div>
 
 <script>
-let keyPair            = null;
-let myPublicKeyB64     = null;
-let recipientCryptoKey = null;
-let recipientKeyB64    = null;
-let firstMessageSent   = false;
-let ws                 = null;
+// ─── State ────────────────────────────────────────────────────────────────────
+let mySessionKeyPair  = null;     // X25519 keypair { privateKey, publicKey }
+let mySessionPubRaw   = null;     // Uint8Array(32)
+let mySessionPubB64   = null;
+let recipientPubRaw   = null;     // Uint8Array(32)
+let recipientPubB64   = null;
+let ratchet           = null;     // active Double Ratchet state
+let firstMessageSent  = false;
+let ws                = null;
 
+// ─── Base64 helpers ───────────────────────────────────────────────────────────
 function ab2b64(buf) {
   return btoa(String.fromCharCode(...new Uint8Array(buf)));
 }
-function b642ab(b64) {
-  return Uint8Array.from(atob(b64), c => c.charCodeAt(0)).buffer;
+function b642u8(b64) {
+  return Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+}
+function concatU8(...parts) {
+  const total = parts.reduce((n, p) => n + p.length, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) { out.set(p, off); off += p.length; }
+  return out;
+}
+function eqU8(a, b) {
+  if (a.length !== b.length) return false;
+  let d = 0;
+  for (let i = 0; i < a.length; i++) d |= a[i] ^ b[i];
+  return d === 0;
 }
 
-async function init() {
-  keyPair = await crypto.subtle.generateKey(
-    { name: "RSA-OAEP", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
-    true,
-    ["encrypt", "decrypt"]
-  );
+// ─── Crypto primitives ────────────────────────────────────────────────────────
+async function genX25519() {
+  const kp = await crypto.subtle.generateKey({ name: "X25519" }, true, ["deriveBits"]);
+  const pubRaw = new Uint8Array(await crypto.subtle.exportKey("raw", kp.publicKey));
+  return { keyPair: kp, pubRaw };
+}
 
-  const spki = await crypto.subtle.exportKey("spki", keyPair.publicKey);
-  myPublicKeyB64 = ab2b64(spki);
-  document.getElementById("myKey").value = myPublicKeyB64;
+async function importX25519Pub(rawU8) {
+  return await crypto.subtle.importKey("raw", rawU8, { name: "X25519" }, true, []);
+}
+
+async function dh(privateKey, peerPubRaw) {
+  const peerPub = await importX25519Pub(peerPubRaw);
+  return new Uint8Array(await crypto.subtle.deriveBits(
+    { name: "X25519", public: peerPub }, privateKey, 256
+  ));
+}
+
+async function hkdf(ikm, salt, infoStr, lenBytes) {
+  const baseKey = await crypto.subtle.importKey("raw", ikm, "HKDF", false, ["deriveBits"]);
+  return new Uint8Array(await crypto.subtle.deriveBits(
+    { name: "HKDF", hash: "SHA-256", salt, info: new TextEncoder().encode(infoStr) },
+    baseKey, lenBytes * 8
+  ));
+}
+
+async function hmac(key32, dataU8) {
+  const k = await crypto.subtle.importKey("raw", key32, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return new Uint8Array(await crypto.subtle.sign("HMAC", k, dataU8));
+}
+
+async function aesGcmEnc(key32, iv12, ptU8, aadU8) {
+  const k = await crypto.subtle.importKey("raw", key32, { name: "AES-GCM" }, false, ["encrypt"]);
+  return new Uint8Array(await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv: iv12, additionalData: aadU8 ?? new Uint8Array(0) }, k, ptU8
+  ));
+}
+
+async function aesGcmDec(key32, iv12, ctU8, aadU8) {
+  const k = await crypto.subtle.importKey("raw", key32, { name: "AES-GCM" }, false, ["decrypt"]);
+  return new Uint8Array(await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: iv12, additionalData: aadU8 ?? new Uint8Array(0) }, k, ctU8
+  ));
+}
+
+// ─── Double Ratchet (Signal spec, simplified) ─────────────────────────────────
+// Naming follows the spec: RK = root key, CKs/CKr = sending/receiving chain key,
+// DHs = my current DH keypair, DHr = peer's last DH pubkey, Ns/Nr = chain indices,
+// PN = previous-chain length (for skipped-message handling, kept minimal here).
+//
+// Bootstrap: rk_0 = HKDF(DH(my_session_priv, peer_session_pub), "Tacenda/init/v1")
+// First sender immediately rotates DHs to a fresh ephemeral and advances rk.
+
+const RK_INFO = "Tacenda/rk/v1";
+const MK_INFO = "Tacenda/mk-mac/v1";
+const INIT_INFO = "Tacenda/init/v1";
+
+async function ratchetInit({ amInitiator, mySessionKP, mySessionPubRaw, peerPubRaw }) {
+  const shared = await dh(mySessionKP.privateKey, peerPubRaw);
+  const rk0 = await hkdf(shared, new Uint8Array(32), INIT_INFO, 32);
+
+  const state = {
+    DHs: mySessionKP,
+    DHs_pub: mySessionPubRaw,
+    DHr: peerPubRaw,
+    RK: rk0,
+    CKs: null,
+    CKr: null,
+    Ns: 0,
+    Nr: 0,
+    PN: 0,
+    burnedMACs: [],   // [{seq, macKey}] — reserved for Phase 4
+  };
+
+  if (amInitiator) {
+    // Rotate: generate a fresh DHs immediately so first message starts a new chain
+    const fresh = await genX25519();
+    state.DHs = fresh.keyPair;
+    state.DHs_pub = fresh.pubRaw;
+    const dhOut = await dh(state.DHs.privateKey, state.DHr);
+    const out = await hkdf(dhOut, state.RK, RK_INFO, 64);
+    state.RK = out.slice(0, 32);
+    state.CKs = out.slice(32, 64);
+  }
+  return state;
+}
+
+async function advanceCK(ck) {
+  // mk_seed = HMAC(ck, 0x01); next_ck = HMAC(ck, 0x02)
+  const mkSeed = await hmac(ck, new Uint8Array([0x01]));
+  const nextCK = await hmac(ck, new Uint8Array([0x02]));
+  const out = await hkdf(mkSeed, new Uint8Array(32), MK_INFO, 64);
+  return { nextCK, mk: out.slice(0, 32), macKey: out.slice(32, 64) };
+}
+
+async function dhRatchetSending(state) {
+  // Used when we receive a new DHr OR when bootstrapping responder's send side.
+  const dhOut = await dh(state.DHs.privateKey, state.DHr);
+  const out = await hkdf(dhOut, state.RK, RK_INFO, 64);
+  state.RK = out.slice(0, 32);
+  state.CKs = out.slice(32, 64);
+  state.PN = state.Ns;
+  state.Ns = 0;
+}
+
+async function dhRatchetReceiving(state, newDHrRaw) {
+  state.DHr = newDHrRaw;
+  const dhOut = await dh(state.DHs.privateKey, state.DHr);
+  const out = await hkdf(dhOut, state.RK, RK_INFO, 64);
+  state.RK = out.slice(0, 32);
+  state.CKr = out.slice(32, 64);
+  state.Nr = 0;
+  // Generate fresh DHs for our next send and prep CKs
+  const fresh = await genX25519();
+  state.DHs = fresh.keyPair;
+  state.DHs_pub = fresh.pubRaw;
+  await dhRatchetSending(state);
+}
+
+async function ratchetEncrypt(state, plaintextU8) {
+  if (!state.CKs) throw new Error("no sending chain (responder must wait for first message)");
+  const { nextCK, mk, macKey } = await advanceCK(state.CKs);
+  state.CKs = nextCK;
+  const seq = state.Ns;
+  state.Ns += 1;
+  state.burnedMACs.push({ seq, macKey });
+
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await aesGcmEnc(mk, iv, plaintextU8);
+
+  // Header authenticated by HMAC (separate from AEAD tag — its key is the burnable mac_key)
+  const header = {
+    dh: ab2b64(state.DHs_pub),
+    pn: state.PN,
+    n:  seq,
+    iv: ab2b64(iv),
+    ct: ab2b64(ct),
+  };
+  const headerBytes = new TextEncoder().encode(JSON.stringify(header));
+  const mac = await hmac(macKey, headerBytes);
+  header.mac = ab2b64(mac);
+  return header;
+}
+
+async function ratchetDecrypt(state, header) {
+  const incomingDHrRaw = b642u8(header.dh);
+  const dhChanged = !state.DHr || !eqU8(incomingDHrRaw, state.DHr);
+  if (dhChanged) {
+    await dhRatchetReceiving(state, incomingDHrRaw);
+  }
+  if (!state.CKr) throw new Error("no receiving chain");
+
+  // Advance CKr until we reach header.n. We only support in-order delivery in
+  // Phase 1; skipped-message keys are not retained. (Future: bounded skip cache.)
+  let mk, macKey;
+  while (state.Nr <= header.n) {
+    const step = await advanceCK(state.CKr);
+    state.CKr = step.nextCK;
+    mk = step.mk;
+    macKey = step.macKey;
+    state.Nr += 1;
+    if (state.Nr - 1 === header.n) break;
+  }
+  if (state.Nr - 1 !== header.n) throw new Error("ratchet desync");
+
+  // Verify HMAC over header-without-mac
+  const headerCopy = { dh: header.dh, pn: header.pn, n: header.n, iv: header.iv, ct: header.ct };
+  const headerBytes = new TextEncoder().encode(JSON.stringify(headerCopy));
+  const expected = await hmac(macKey, headerBytes);
+  if (!eqU8(expected, b642u8(header.mac))) throw new Error("mac mismatch");
+
+  const iv = b642u8(header.iv);
+  const ct = b642u8(header.ct);
+  const pt = await aesGcmDec(mk, iv, ct);
+  return pt;
+}
+
+// ─── App init ─────────────────────────────────────────────────────────────────
+async function init() {
+  const session = await genX25519();
+  mySessionKeyPair = session.keyPair;
+  mySessionPubRaw  = session.pubRaw;
+  mySessionPubB64  = ab2b64(mySessionPubRaw);
+  document.getElementById("myKey").value = mySessionPubB64;
 
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   ws = new WebSocket(`${proto}//${location.host}/ws`);
 
   ws.onopen = () => {
-    ws.send(JSON.stringify({ type: "register", publicKey: myPublicKeyB64 }));
+    ws.send(JSON.stringify({ type: "register", publicKey: mySessionPubB64 }));
     addSystem("connected — your keys are ready. share your public key to start a conversation.");
   };
 
@@ -235,62 +426,53 @@ async function setRecipient(keyB64Override) {
   const raw = (keyB64Override ?? document.getElementById("recipientKey").value).trim();
   if (!raw) return;
 
+  let pubRaw;
   try {
-    recipientCryptoKey = await crypto.subtle.importKey(
-      "spki", b642ab(raw),
-      { name: "RSA-OAEP", hash: "SHA-256" },
-      true, ["encrypt"]
-    );
-    recipientKeyB64 = raw;
-    firstMessageSent = false;
-
-    if (!keyB64Override) document.getElementById("recipientKey").value = raw;
-
-    setHint("recipientHint", "recipient key loaded — messages are end-to-end encrypted", "ok");
-    document.getElementById("msgInput").disabled = false;
-    document.getElementById("sendBtn").disabled = false;
-    document.getElementById("msgInput").focus();
-  } catch {
-    setHint("recipientHint", "invalid key — make sure you pasted it completely", "err");
+    pubRaw = b642u8(raw);
+    if (pubRaw.length !== 32) throw new Error("X25519 pubkey must be 32 bytes");
+    // Validate by importing
+    await importX25519Pub(pubRaw);
+  } catch (e) {
+    setHint("recipientHint", "invalid key — must be a 32-byte X25519 pubkey (base64)", "err");
+    return;
   }
-}
 
-async function encryptPayload(plaintext) {
-  const aesKey = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt"]);
-  const iv     = crypto.getRandomValues(new Uint8Array(12));
+  recipientPubRaw = pubRaw;
+  recipientPubB64 = raw;
+  firstMessageSent = false;
 
-  const encryptedMsg = await crypto.subtle.encrypt(
-    { name: "AES-GCM", iv }, aesKey,
-    new TextEncoder().encode(plaintext)
-  );
-  const rawAes       = await crypto.subtle.exportKey("raw", aesKey);
-  const encryptedKey = await crypto.subtle.encrypt({ name: "RSA-OAEP" }, recipientCryptoKey, rawAes);
+  // Bootstrap ratchet as initiator (we're about to send). If a message arrives
+  // before we send, handleIncoming will re-init as responder.
+  ratchet = await ratchetInit({
+    amInitiator: true,
+    mySessionKP: mySessionKeyPair,
+    mySessionPubRaw,
+    peerPubRaw: pubRaw,
+  });
 
-  return { k: ab2b64(encryptedKey), iv: ab2b64(iv), msg: ab2b64(encryptedMsg) };
-}
+  if (!keyB64Override) document.getElementById("recipientKey").value = raw;
 
-async function decryptPayload(payload) {
-  const rawAes = await crypto.subtle.decrypt(
-    { name: "RSA-OAEP" }, keyPair.privateKey, b642ab(payload.k)
-  );
-  const aesKey = await crypto.subtle.importKey("raw", rawAes, { name: "AES-GCM" }, false, ["decrypt"]);
-  const plain  = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: new Uint8Array(b642ab(payload.iv)) }, aesKey, b642ab(payload.msg)
-  );
-  return new TextDecoder().decode(plain);
+  setHint("recipientHint", "recipient key loaded — messages are forward-secret (Double Ratchet)", "ok");
+  document.getElementById("msgInput").disabled = false;
+  document.getElementById("sendBtn").disabled = false;
+  document.getElementById("msgInput").focus();
 }
 
 async function sendMessage() {
   const input = document.getElementById("msgInput");
   const text  = input.value.trim();
-  if (!text || !recipientCryptoKey || !ws || ws.readyState !== WebSocket.OPEN) return;
+  if (!text || !ratchet || !ws || ws.readyState !== WebSocket.OPEN) return;
 
-  const payload = await encryptPayload(text);
+  const ptBytes = new TextEncoder().encode(text);
+  const payload = await ratchetEncrypt(ratchet, ptBytes);
+
+  // Phase 1: always send senderKey so peers can route. Phase 2 (trial-decrypt)
+  // will drop this field along with the `to` field.
   ws.send(JSON.stringify({
     type: "message",
-    to: recipientKeyB64,
+    to: recipientPubB64,
     payload,
-    senderKey: firstMessageSent ? undefined : myPublicKeyB64,
+    senderKey: mySessionPubB64,
   }));
 
   firstMessageSent = true;
@@ -299,15 +481,42 @@ async function sendMessage() {
 }
 
 async function handleIncoming(msg) {
-  if (msg.senderKey && !recipientCryptoKey) {
-    await setRecipient(msg.senderKey);
-    addSystem("recipient key auto-loaded from incoming message — you can reply now.");
+  // First contact from this peer — initialize ratchet as responder using their session pub
+  if (msg.senderKey && !ratchet) {
+    let pubRaw;
+    try {
+      pubRaw = b642u8(msg.senderKey);
+      if (pubRaw.length !== 32) throw new Error("bad pubkey");
+      await importX25519Pub(pubRaw);
+    } catch {
+      addSystem("⚠ incoming message has malformed sender key.");
+      return;
+    }
+    recipientPubRaw = pubRaw;
+    recipientPubB64 = msg.senderKey;
+    document.getElementById("recipientKey").value = msg.senderKey;
+    ratchet = await ratchetInit({
+      amInitiator: false,
+      mySessionKP: mySessionKeyPair,
+      mySessionPubRaw,
+      peerPubRaw: pubRaw,
+    });
+    document.getElementById("msgInput").disabled = false;
+    document.getElementById("sendBtn").disabled = false;
+    setHint("recipientHint", "recipient key auto-loaded from incoming message — you can reply now.", "ok");
   }
+
+  if (!ratchet) {
+    addSystem("⚠ received message but no ratchet state.");
+    return;
+  }
+
   try {
-    const plaintext = await decryptPayload(msg.payload);
-    addMessage(plaintext, "received");
-  } catch {
-    addSystem("⚠ could not decrypt a message — keys may not match.");
+    const ptBytes = await ratchetDecrypt(ratchet, msg.payload);
+    const text = new TextDecoder().decode(ptBytes);
+    addMessage(text, "received");
+  } catch (e) {
+    addSystem("⚠ could not decrypt a message — " + e.message);
   }
 }
 

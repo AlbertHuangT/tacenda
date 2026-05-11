@@ -226,6 +226,27 @@
     obtains it can impersonate you and intercept handshakes addressed to you.
   </p>
 
+  <div class="warning" style="background:#11100a;border-color:#2a2618;">
+    <p style="color:#6a6030;margin-bottom:8px;">
+      <strong style="color:#9a8a40;">⚠ Key = Identity:</strong> your public key is your
+      <em>only</em> identifier in this system. There are no usernames, no emails,
+      no account recovery. Contacts address messages to your public key — it <em>is</em>
+      your address.
+    </p>
+    <p style="color:#6a6030;margin-bottom:8px;">
+      If you generate a new key pair for any reason, you effectively create a
+      <em>new identity</em>. All existing contact relationships become <em>one-way</em>:
+      you can still send messages to anyone whose public key you have, but they will
+      be unable to reach you — their messages will be addressed to your old key,
+      which no longer exists.
+    </p>
+    <p style="color:#6a6030;margin-bottom:0;">
+      This remains broken until <em>you</em> proactively contact each person and share
+      your new public key. Treat key generation as irreversible — back up your
+      private key carefully.
+    </p>
+  </div>
+
   <div class="warning">
     <p>
       <strong>Note:</strong> this page generates keys inside your browser using the
@@ -248,7 +269,7 @@
     <p class="field-label">Your long-term public key &nbsp;—&nbsp; share this with contacts</p>
     <textarea id="pubKeyOut" rows="5" readonly></textarea>
     <div class="btn-row">
-      <button class="action" onclick="copyPub()">copy public key</button>
+      <button class="action" onclick="copyPub(this)">copy public key</button>
     </div>
   </div>
 
@@ -302,20 +323,20 @@ let privPEM = null;
 async function generate() {
   const btn = document.getElementById("generateBtn");
   btn.disabled = true;
-  setStatus("generating RSA-2048 key pair…", "");
+  setStatus("generating X25519 key pair…", "");
 
   try {
     const keyPair = await crypto.subtle.generateKey(
-      { name: "RSA-OAEP", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
+      { name: "X25519" },
       true,
-      ["encrypt", "decrypt"]
+      ["deriveBits"]
     );
 
-    // Export public key → SPKI base64 (same format as the chat client)
-    const spkiBuf = await crypto.subtle.exportKey("spki", keyPair.publicKey);
-    const pubB64  = ab2b64(spkiBuf);
+    // Public key → raw 32 bytes → base64 (44 chars, same format as the chat client)
+    const rawPub = await crypto.subtle.exportKey("raw", keyPair.publicKey);
+    const pubB64 = ab2b64(rawPub);
 
-    // Export private key → PKCS#8 PEM (compatible with Go CLI and OpenSSL)
+    // Private key → PKCS#8 PEM (RFC 8410 format, readable by Go's crypto/x509 ParsePKCS8PrivateKey)
     const pkcs8Buf = await crypto.subtle.exportKey("pkcs8", keyPair.privateKey);
     const privB64  = ab2b64(pkcs8Buf);
     privPEM = toPEM(privB64, "PRIVATE KEY");
@@ -333,10 +354,9 @@ async function generate() {
   }
 }
 
-async function copyPub() {
+async function copyPub(btn) {
   const val = document.getElementById("pubKeyOut").value;
   await navigator.clipboard.writeText(val);
-  const btn = event.target;
   btn.textContent = "copied!";
   setTimeout(() => (btn.textContent = "copy public key"), 1800);
 }
