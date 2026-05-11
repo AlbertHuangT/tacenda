@@ -3,4 +3,6 @@ logs/
 .DS_Store
 cli/tacenda-cli
 cli/rsa-chat-cli
-.wrangler/
+.agents/
+.claude/
+skills-lock.json
