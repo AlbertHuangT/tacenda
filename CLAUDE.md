@@ -1,58 +1,95 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code working in this repo.
+
+## Deployment
+
+**Production runs on the user's Mac**, NOT on Cloudflare Workers, despite `worker.js` + `wrangler.toml` existing in the tree.
+
+- `launchctl` job `com.rsa-chat.server` runs `node /Users/albert/Desktop/rsa-chat/server.js` on port 3000
+- `launchctl` job `com.rsa-chat.tunnel` runs `cloudflared` per `cloudflared.yml`, exposing `localhost:3000` → `https://ppb1s0n.us.kg`
+- The repo at `/Users/albert/Desktop/rsa-chat/` is the live source of truth for both static files (served from `public/`) and `server.js`
+
+**To deploy** (run from anywhere):
+```bash
+git -C /Users/albert/Desktop/rsa-chat pull
+launchctl kickstart -k "gui/$(id -u)/com.rsa-chat.server"
+```
+Static-file-only changes (HTML/JS in `public/`) take effect on the next page load even without the restart, since `server.js` reads from disk each request.
+
+**Do not** use `npm run deploy` / `wrangler deploy` — the user does not use Cloudflare Workers and has no `workers.dev` subdomain. `worker.js` is kept around but unused; treat it as a parallel implementation only relevant if the project ever switches deploy modes.
 
 ## Commands
 
 ```bash
-npm install                  # install deps (includes wrangler)
-npm run dev                  # local dev via wrangler (http://localhost:8787)
-npm run deploy               # deploy to Cloudflare Workers
-node server.js               # legacy local Node.js server (ws://localhost:3000)
+npm install                  # install deps (ws + wrangler — wrangler unused)
+node server.js               # local dev (port 3000)
+cd cli && go build -o tacenda-cli .
+./tacenda-cli --keygen --out ~/.tacenda/identity.pem
 ```
-
-**First-time Cloudflare setup:**
-```bash
-npx wrangler login           # authenticate with Cloudflare
-npm run deploy               # creates the Worker and Durable Object on first run
-```
-
-> Durable Objects require the **Workers Paid plan** ($5/month). The free tier does not support them.
 
 ## Architecture
 
-Two-file app, no framework, no database, no persistent storage of any kind.
+No framework, no database, no persistent storage. Three components share one wire protocol.
 
 ### Server (`server.js`)
 
-Node.js WebSocket server on port 3000. Maintains one in-memory `Map<publicKeyBase64, WebSocket>` as a routing table — nothing else.
+~100-line Node.js WebSocket server. In-memory `Map<sessionPubKeyB64, WebSocket>` is the entire state.
 
-**Protocol (three message types):**
-- `{ type: "register", publicKey }` — client announces its public key as its address; server adds it to the map
-- `{ type: "message", to, payload, senderKey? }` — server looks up `to` in the map and forwards the envelope verbatim; sends `{ type: "error", message }` back if recipient isn't online
-- `{ type: "handshake_broadcast", payload, senderSession }` — server broadcasts to all other connected clients; payload is a hybrid-encrypted blob (object or string), senderSession is the sender's session public key (base64); size-limited to 2048 + 512 bytes
+**Protocol — three message types:**
+- `{ type: "register", publicKey }` — client announces its session pubkey as its routing address
+- `{ type: "message", to, payload, senderKey }` — server routes to the `to` socket; `payload` is an opaque Double Ratchet header (see below). Server never reads `payload`.
+- `{ type: "handshake_broadcast", payload, senderSession }` — broadcast to all other sockets; used by CLI for ECIES-style handshake (web client doesn't initiate handshakes — recipients paste session pubkeys directly).
 
-Disconnect removes the entry immediately. Server never reads `payload` content.
+`worker.js` mirrors the same protocol on Cloudflare Durable Objects but is not the active deployment.
 
 ### Pages
 
-Three pages under `public/`, all inline JS, no dependencies:
-- `public/index.html` — landing page (documentation, links to chat and keygen)
-- `public/chat.html` — chat interface (session key gen, messaging)
-- `public/keygen.html` — identity key generator (long-term RSA key pair)
+- `public/index.html` — landing page
+- `public/chat.html` — chat UI; all JS inline, no dependencies
+- `public/keygen.html` — long-term identity key generator
 
-### Chat Client (`public/chat.html`)
+### Cryptography (current)
 
-Single HTML file, all JS inline. No dependencies.
+**Replaced RSA-OAEP with X25519 + Double Ratchet** (Signal-style). Both `public/chat.html` and `cli/main.go` implement the same protocol.
 
-**Startup:** generates an RSA-OAEP 2048-bit key pair via Web Crypto API, exports the public key as base64 SPKI, then registers with the server. The private key is a `CryptoKey` object — never serialized, destroyed with the page.
+- **Session keys**: ephemeral X25519, generated on page load / CLI start
+- **Long-term identity keys**: X25519, exported as PKCS#8 PEM (RFC 8410). Only the CLI uses these (for receiving broadcast handshakes); the web client only has session keys
+- **Initial DH**: `rk_0 = HKDF(DH(my_session_priv, peer_session_pub), info="Tacenda/init/v1")`
+- **Per-message ratchet**: each send advances an HMAC-SHA256 chain key → derives `(message_key, mac_key)` via HKDF
+- **DH ratchet**: when peer rotates DH pubkey, advance root key via HKDF over fresh DH output; rotate own DH for reply
+- **AEAD**: AES-GCM-128 for message body; HMAC-SHA256 over the header. The separate MAC is what gets published on burn (Phase 4, not yet implemented)
+- **Handshake (CLI only)**: ECIES sealed-box — ephemeral X25519 + HKDF → AES-GCM encrypts sender's session pubkey to recipient's long-term pubkey
 
-**Encryption scheme (hybrid):**
-1. Generate a random AES-GCM-256 key + 12-byte IV
-2. Encrypt the plaintext with AES-GCM
-3. Wrap the AES key with the recipient's RSA public key (RSA-OAEP)
-4. Send `{ k, iv, msg }` (all base64) — this fits RSA's 190-byte limit while supporting arbitrary message lengths
+**Wire format for `payload` in `message`:**
+```js
+{
+  dh: <b64 32B sender ratchet pub>,
+  pn: <int previous chain length>,
+  n:  <int message number in current chain>,
+  iv: <b64 12B AES-GCM nonce>,
+  ct: <b64 AES-GCM ciphertext>,
+  mac: <b64 HMAC over {dh,pn,n,iv,ct} JSON>
+}
+```
 
-**Routing:** each user's public key *is* their address. User A pastes User B's public key → messages are addressed `to: UserB.publicKeyBase64`.
+HMAC is computed over the **exact JSON bytes** of `{dh,pn,n,iv,ct}` in that field order — `cli/main.go`'s `canonicalHeaderJSON` must produce identical bytes to JS's `JSON.stringify({dh, pn, n, iv, ct})`.
 
-**Key exchange:** the first outbound message includes `senderKey: myPublicKeyBase64`. When the recipient receives it, their client auto-populates the reply-to field — no manual copy/paste needed for the response direction.
+**Wire format for `payload` in `handshake_broadcast`:**
+```js
+{ eph: <b64 32B ephemeral X25519 pub>, iv: <b64 12B>, ct: <b64 AES-GCM(sender's session pub)> }
+```
+
+### Phase 1 → Phase 4 plan
+
+The crypto migration above is **Phase 1** of a larger redesign documented in `/Users/albert/.claude/plans/pull-snoopy-rose.md`. Upcoming:
+- **Phase 2**: drop the `to` field; trial-decrypt all incoming messages
+- **Phase 3**: constant-rate equal-size slot scheduler (anonymous broadcast room)
+- **Phase 4**: burn UI — publish past MAC keys to enable deniable transcripts
+
+## Code conventions observed in this repo
+
+- Inline JS in HTML, no build step, no framework
+- Server-side: zero dependencies beyond `ws` (and `gorilla/websocket` + `golang.org/x/crypto` in CLI)
+- Comments only where the *why* is non-obvious — no docstrings, no narration of *what* the code does
+- Dark theme, mono font, green/blue accents
