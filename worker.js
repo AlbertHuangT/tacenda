@@ -12,9 +12,11 @@ export default {
   },
 };
 
-// ChatRoom Durable Object — anonymous broadcast room. Forwards every well-formed
-// JSON envelope to all other connected sockets. No routing table, no per-client
-// state. Clients use Double Ratchet + trial-decrypt to find their messages.
+// ChatRoom Durable Object — anonymous broadcast room. Accepts only 1024-byte
+// binary slots and forwards them to all other connected sockets. No JSON
+// parsing, no routing table, no per-client state.
+const SLOT_SIZE = 1024;
+
 export class ChatRoom {
   constructor(state) { this.state = state; }
 
@@ -29,11 +31,9 @@ export class ChatRoom {
   }
 
   async webSocketMessage(ws, message) {
-    if (typeof message !== "string") message = new TextDecoder().decode(message);
-    if (message.length > 8192) return;
-    let msg;
-    try { msg = JSON.parse(message); } catch { return; }
-    if (msg.type !== "message" && msg.type !== "handshake_broadcast") return;
+    // Cloudflare delivers binary frames as ArrayBuffer; strings come as string.
+    if (typeof message === "string") return;
+    if (message.byteLength !== SLOT_SIZE) return;
     for (const socket of this.state.getWebSockets()) {
       if (socket !== ws) socket.send(message);
     }

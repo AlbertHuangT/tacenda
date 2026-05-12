@@ -3,12 +3,13 @@ const fs   = require("fs");
 const path = require("path");
 const WebSocket = require("ws");
 
-// Anonymous broadcast room: server forwards every well-formed JSON envelope to
-// all other connected sockets. No routing table, no recipient lookup, no
-// per-client state. Clients use Double Ratchet + trial-decrypt to find their
-// own messages and ECIES sealed-box handshakes to bootstrap each conversation.
+// Anonymous broadcast room (Phase 3): every client emits a fixed-size 1024-byte
+// binary slot at a fixed cadence. Real ciphertext and pure noise are
+// indistinguishable on the wire. Server checks length and broadcasts; it has
+// no per-client state, no JSON parsing, no idea what slots contain.
 
 const PUBLIC = path.join(__dirname, "public");
+const SLOT_SIZE = 1024;
 
 const ROUTES = {
   "/":           "index.html",
@@ -42,32 +43,21 @@ server.on("upgrade", (request, socket, head) => {
   }
 });
 
-const MAX_FRAME = 8192; // generous for ratchet headers; tightened to 1024 in Phase 3
-
 wss.on("connection", function (ws) {
   console.log(`client joined  (${wss.clients.size} online)`);
-
-  ws.on("message", function (data) {
-    if (data.length > MAX_FRAME) return;
-    const text = data.toString();
-    // Light shape check so random TCP traffic doesn't get fanned out
-    let msg;
-    try { msg = JSON.parse(text); } catch { return; }
-    if (msg.type !== "message" && msg.type !== "handshake_broadcast") return;
-
+  ws.on("message", function (data, isBinary) {
+    // Phase 3: only fixed-length binary slots are valid; anything else is dropped.
+    if (!isBinary || data.length !== SLOT_SIZE) return;
     for (const client of wss.clients) {
       if (client !== ws && client.readyState === WebSocket.OPEN) {
-        client.send(text);
+        client.send(data, { binary: true });
       }
     }
   });
-
-  ws.on("close", () => {
-    console.log(`client left    (${wss.clients.size} online)`);
-  });
+  ws.on("close", () => console.log(`client left    (${wss.clients.size} online)`));
 });
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`Tacenda server → http://localhost:${PORT}`);
+  console.log(`Tacenda server → http://localhost:${PORT}  (slot=${SLOT_SIZE}B)`);
 });

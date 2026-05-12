@@ -275,23 +275,58 @@ const MK_INFO = "Tacenda/mk-mac/v1";
 const INIT_INFO = "Tacenda/init/v1";
 const HS_INFO = "Tacenda/handshake/v1";
 
-// ─── ECIES sealed-box for handshakes ──────────────────────────────────────────
-// Encrypt a 33-byte plaintext ([intent_byte, ...32B session_pub]) to a peer's
-// X25519 public key. Anyone without the matching private key gets a decryption
-// failure and silently drops the message.
-async function ecesEncrypt(recipientPubRaw, plaintextU8) {
-  const eph = await genX25519();
-  const shared = await dh(eph.keyPair.privateKey, recipientPubRaw);
-  const key = await hkdf(shared, new Uint8Array(32), HS_INFO, 32);
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ct = await aesGcmEnc(key, iv, plaintextU8);
-  return { eph: ab2b64(eph.pubRaw), iv: ab2b64(iv), ct: ab2b64(ct) };
+// ─── Slot format (Phase 3) ────────────────────────────────────────────────────
+// Fixed 1024-byte binary blob on the wire. Every client emits one slot every
+// SLOT_INTERVAL_MS, with either a real ciphertext or pure random noise. Real
+// and noise are indistinguishable to the server and to network observers.
+//
+// Layout:
+//   [0..32]    pub   — X25519 32B (ratchet DH pub OR ECIES ephemeral pub)
+//   [32..44]   iv    — AES-GCM 12B nonce
+//   [44..76]   mac   — HMAC-SHA256 (ratchet); random bytes (handshake / noise)
+//   [76..1024] ct    — AES-GCM(plaintext_932B) → 932 + 16B tag = 948B
+//
+// Plaintext (932 bytes after AES-GCM auth):
+//   [0..2]    msg_len  uint16 BE (0..922)
+//   [2..6]    pn       uint32 BE (ratchet only, else 0)
+//   [6..10]   n        uint32 BE (ratchet only, else 0)
+//   [10..10+msg_len] msg
+//   [10+msg_len..932] random padding
+
+const SLOT_SIZE = 1024;
+const SLOT_PUB_OFFSET = 0;
+const SLOT_IV_OFFSET = 32;
+const SLOT_MAC_OFFSET = 44;
+const SLOT_CT_OFFSET = 76;
+const SLOT_CT_SIZE = SLOT_SIZE - SLOT_CT_OFFSET; // 948
+const SLOT_PT_SIZE = SLOT_CT_SIZE - 16;          // 932 (AES-GCM tag is 16B)
+const SLOT_META_SIZE = 10;                        // 2 + 4 + 4
+const MAX_MSG_LEN = SLOT_PT_SIZE - SLOT_META_SIZE; // 922
+const SLOT_INTERVAL_MS = 2000;
+
+// Pack arbitrary message bytes (length ≤ 922) into a 932-byte plaintext block,
+// padded with random bytes so that ciphertext length is always 948.
+function packPlaintext(msgU8, pn, n) {
+  if (msgU8.length > MAX_MSG_LEN) throw new Error("message too long for one slot");
+  const pt = crypto.getRandomValues(new Uint8Array(SLOT_PT_SIZE));
+  const dv = new DataView(pt.buffer);
+  dv.setUint16(0, msgU8.length, false);
+  dv.setUint32(2, pn >>> 0, false);
+  dv.setUint32(6, n  >>> 0, false);
+  pt.set(msgU8, SLOT_META_SIZE);
+  // bytes after SLOT_META_SIZE + msgU8.length stay random (already filled above)
+  return pt;
 }
-async function ecesDecrypt(myPrivKey, payload) {
-  const ephPub = b642u8(payload.eph);
-  const shared = await dh(myPrivKey, ephPub);
-  const key = await hkdf(shared, new Uint8Array(32), HS_INFO, 32);
-  return await aesGcmDec(key, b642u8(payload.iv), b642u8(payload.ct));
+
+function unpackPlaintext(ptU8) {
+  if (ptU8.length !== SLOT_PT_SIZE) throw new Error("bad plaintext size");
+  const dv = new DataView(ptU8.buffer, ptU8.byteOffset, ptU8.byteLength);
+  const msgLen = dv.getUint16(0, false);
+  if (msgLen > MAX_MSG_LEN) throw new Error("declared msg_len exceeds budget");
+  const pn = dv.getUint32(2, false);
+  const n  = dv.getUint32(6, false);
+  const msg = ptU8.subarray(SLOT_META_SIZE, SLOT_META_SIZE + msgLen);
+  return { msg, pn, n };
 }
 
 async function ratchetInit({ amInitiator, mySessionKP, mySessionPubRaw, peerPubRaw }) {
@@ -356,62 +391,124 @@ async function dhRatchetReceiving(state, newDHrRaw) {
   await dhRatchetSending(state);
 }
 
-async function ratchetEncrypt(state, plaintextU8) {
+// ─── Slot encoders ────────────────────────────────────────────────────────────
+async function encodeRatchetSlot(state, msgU8) {
   if (!state.CKs) throw new Error("no sending chain (responder must wait for first message)");
-  const { nextCK, mk, macKey } = await advanceCK(state.CKs);
-  state.CKs = nextCK;
+  const step = await advanceCK(state.CKs);
+  state.CKs = step.nextCK;
   const seq = state.Ns;
   state.Ns += 1;
-  state.burnedMACs.push({ seq, macKey });
+  state.burnedMACs.push({ seq, macKey: step.macKey });
 
+  const pt = packPlaintext(msgU8, state.PN, seq);
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ct = await aesGcmEnc(mk, iv, plaintextU8);
+  const ct = await aesGcmEnc(step.mk, iv, pt);
 
-  // Header authenticated by HMAC (separate from AEAD tag — its key is the burnable mac_key)
-  const header = {
-    dh: ab2b64(state.DHs_pub),
-    pn: state.PN,
-    n:  seq,
-    iv: ab2b64(iv),
-    ct: ab2b64(ct),
-  };
-  const headerBytes = new TextEncoder().encode(JSON.stringify(header));
-  const mac = await hmac(macKey, headerBytes);
-  header.mac = ab2b64(mac);
-  return header;
+  const slot = new Uint8Array(SLOT_SIZE);
+  slot.set(state.DHs_pub, SLOT_PUB_OFFSET);
+  slot.set(iv, SLOT_IV_OFFSET);
+  slot.set(ct, SLOT_CT_OFFSET);
+
+  // MAC over [pub || iv || ct]; the mac field itself is excluded
+  const macInput = new Uint8Array(32 + 12 + SLOT_CT_SIZE);
+  macInput.set(slot.subarray(SLOT_PUB_OFFSET, SLOT_PUB_OFFSET + 32), 0);
+  macInput.set(slot.subarray(SLOT_IV_OFFSET,  SLOT_IV_OFFSET + 12), 32);
+  macInput.set(slot.subarray(SLOT_CT_OFFSET,  SLOT_SIZE), 32 + 12);
+  const mac = await hmac(step.macKey, macInput);
+  slot.set(mac, SLOT_MAC_OFFSET);
+  return slot;
 }
 
-async function ratchetDecrypt(state, header) {
-  const incomingDHrRaw = b642u8(header.dh);
-  const dhChanged = !state.DHr || !eqU8(incomingDHrRaw, state.DHr);
-  if (dhChanged) {
-    await dhRatchetReceiving(state, incomingDHrRaw);
-  }
-  if (!state.CKr) throw new Error("no receiving chain");
+async function encodeHandshakeSlot(recipientPubRaw, msgU8) {
+  const eph = await genX25519();
+  const shared = await dh(eph.keyPair.privateKey, recipientPubRaw);
+  const key = await hkdf(shared, new Uint8Array(32), HS_INFO, 32);
 
-  // Advance CKr until we reach header.n. We only support in-order delivery in
-  // Phase 1; skipped-message keys are not retained. (Future: bounded skip cache.)
-  let mk, macKey;
-  while (state.Nr <= header.n) {
+  const pt = packPlaintext(msgU8, 0, 0);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await aesGcmEnc(key, iv, pt);
+
+  const slot = new Uint8Array(SLOT_SIZE);
+  slot.set(eph.pubRaw, SLOT_PUB_OFFSET);
+  slot.set(iv, SLOT_IV_OFFSET);
+  // mac field is random — indistinguishable from a real ratchet MAC
+  crypto.getRandomValues(slot.subarray(SLOT_MAC_OFFSET, SLOT_MAC_OFFSET + 32));
+  slot.set(ct, SLOT_CT_OFFSET);
+  return slot;
+}
+
+// ─── Trial-decrypt ────────────────────────────────────────────────────────────
+// Caller tries ECIES against my privkey(s) first (handshake); then ratchet
+// against the active ratchet (message). Each path leaves no state behind on
+// failure.
+
+async function tryEciesDecrypt(myPrivKey, slot) {
+  const pub = slot.subarray(SLOT_PUB_OFFSET, SLOT_PUB_OFFSET + 32);
+  const iv  = slot.subarray(SLOT_IV_OFFSET,  SLOT_IV_OFFSET + 12);
+  const ct  = slot.subarray(SLOT_CT_OFFSET,  SLOT_SIZE);
+  let pt;
+  try {
+    const shared = await dh(myPrivKey, pub);
+    const key = await hkdf(shared, new Uint8Array(32), HS_INFO, 32);
+    pt = await aesGcmDec(key, iv, ct);
+  } catch { return null; }
+  try { return unpackPlaintext(pt).msg; } catch { return null; }
+}
+
+async function tryRatchetDecrypt(state, slot) {
+  const pub = slot.subarray(SLOT_PUB_OFFSET, SLOT_PUB_OFFSET + 32);
+  const iv  = slot.subarray(SLOT_IV_OFFSET,  SLOT_IV_OFFSET + 12);
+  const mac = slot.subarray(SLOT_MAC_OFFSET, SLOT_MAC_OFFSET + 32);
+  const ct  = slot.subarray(SLOT_CT_OFFSET,  SLOT_SIZE);
+
+  // Snapshot mutable fields so we can restore on any failure
+  const saved = {
+    DHs: state.DHs, DHs_pub: state.DHs_pub, DHr: state.DHr,
+    RK: state.RK, CKs: state.CKs, CKr: state.CKr,
+    Ns: state.Ns, Nr: state.Nr, PN: state.PN,
+  };
+  try {
+    if (!state.DHr || !eqU8(pub, state.DHr)) {
+      await dhRatchetReceiving(state, new Uint8Array(pub));
+    }
+    if (!state.CKr) throw 0;
     const step = await advanceCK(state.CKr);
     state.CKr = step.nextCK;
-    mk = step.mk;
-    macKey = step.macKey;
     state.Nr += 1;
-    if (state.Nr - 1 === header.n) break;
+
+    // Verify MAC before trusting plaintext
+    const macInput = new Uint8Array(32 + 12 + SLOT_CT_SIZE);
+    macInput.set(pub, 0);
+    macInput.set(iv,  32);
+    macInput.set(ct,  44);
+    const expected = await hmac(step.macKey, macInput);
+    if (!eqU8(expected, mac)) throw 0;
+
+    const pt = await aesGcmDec(step.mk, iv, ct);
+    return unpackPlaintext(pt).msg;
+  } catch {
+    Object.assign(state, saved);
+    return null;
   }
-  if (state.Nr - 1 !== header.n) throw new Error("ratchet desync");
+}
 
-  // Verify HMAC over header-without-mac
-  const headerCopy = { dh: header.dh, pn: header.pn, n: header.n, iv: header.iv, ct: header.ct };
-  const headerBytes = new TextEncoder().encode(JSON.stringify(headerCopy));
-  const expected = await hmac(macKey, headerBytes);
-  if (!eqU8(expected, b642u8(header.mac))) throw new Error("mac mismatch");
+// ─── Send queue + slot scheduler (Phase 3 anonymous broadcast room) ──────────
+// Real messages and handshakes are queued; the scheduler emits one 1024-byte
+// slot every SLOT_INTERVAL_MS regardless of whether anything is queued (random
+// noise fills empty ticks). On the wire, real traffic and silence are
+// cryptographically indistinguishable.
 
-  const iv = b642u8(header.iv);
-  const ct = b642u8(header.ct);
-  const pt = await aesGcmDec(mk, iv, ct);
-  return pt;
+const sendQueue = []; // Array<Uint8Array(1024)>
+
+async function tick() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  let slot;
+  if (sendQueue.length > 0) {
+    slot = sendQueue.shift();
+  } else {
+    slot = crypto.getRandomValues(new Uint8Array(SLOT_SIZE));
+  }
+  ws.send(slot);
 }
 
 // ─── App init ─────────────────────────────────────────────────────────────────
@@ -424,16 +521,18 @@ async function init() {
 
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   ws = new WebSocket(`${proto}//${location.host}/ws`);
+  ws.binaryType = "arraybuffer";
 
   ws.onopen = () => {
     addSystem("connected — share your public key to start a conversation.");
+    addSystem(`broadcasting one ${SLOT_SIZE}-byte slot every ${SLOT_INTERVAL_MS / 1000}s (real ↔ noise indistinguishable).`);
+    setInterval(tick, SLOT_INTERVAL_MS);
   };
 
   ws.onmessage = (event) => {
-    let msg;
-    try { msg = JSON.parse(event.data); } catch { return; }
-    if (msg.type === "handshake_broadcast") handleHandshake(msg);
-    else if (msg.type === "message") handleMessage(msg);
+    if (!(event.data instanceof ArrayBuffer)) return;
+    if (event.data.byteLength !== SLOT_SIZE) return;
+    handleSlot(new Uint8Array(event.data));
   };
 
   ws.onerror = () => addSystem("⚠ connection error — check your network.");
@@ -445,9 +544,8 @@ async function init() {
   };
 }
 
-// User pasted recipient's pubkey → send init handshake. Ratchet is set up only
-// once we receive the peer's reply handshake (or an init from them, if they're
-// also initiating).
+// User pasted recipient's pubkey → enqueue init handshake slot. Ratchet is
+// set up only once we receive the peer's reply (or an init from them).
 async function setRecipient(keyB64Override) {
   const raw = (keyB64Override ?? document.getElementById("recipientKey").value).trim();
   if (!raw) return;
@@ -467,37 +565,49 @@ async function setRecipient(keyB64Override) {
   iInitiated = true;
   ratchet = null;
 
-  // Init handshake plaintext = [0x00, my_session_pub (32B)]
-  const plaintext = concatU8(new Uint8Array([0x00]), mySessionPubRaw);
-  const payload = await ecesEncrypt(pubRaw, plaintext);
-  ws.send(JSON.stringify({ type: "handshake_broadcast", payload }));
+  const plaintext = concatU8(new Uint8Array([0x00]), mySessionPubRaw); // init
+  const slot = await encodeHandshakeSlot(pubRaw, plaintext);
+  sendQueue.push(slot);
 
   if (!keyB64Override) document.getElementById("recipientKey").value = raw;
-  setHint("recipientHint", "handshake sent — waiting for recipient to come online", "muted");
+  setHint("recipientHint", "handshake queued — sends on next slot tick (up to 2s)", "muted");
   document.getElementById("msgInput").disabled = true;
   document.getElementById("sendBtn").disabled = true;
 }
 
-async function handleHandshake(msg) {
-  let plaintext;
-  try { plaintext = await ecesDecrypt(mySessionKeyPair.privateKey, msg.payload); }
-  catch { return; } // not for us
-  if (plaintext.length !== 33) return;
+// Single slot handler: trial-decrypt as ECIES first (handshake?), then ratchet
+// (message?). Failures are silent — most slots are noise or not for us.
+async function handleSlot(slot) {
+  // Handshake path
+  const hsPt = await tryEciesDecrypt(mySessionKeyPair.privateKey, slot);
+  if (hsPt && hsPt.length === 33) {
+    await handleHandshakePlaintext(hsPt);
+    return;
+  }
+  // Message path
+  if (ratchet) {
+    const msgBytes = await tryRatchetDecrypt(ratchet, slot);
+    if (msgBytes) {
+      addMessage(new TextDecoder().decode(msgBytes), "received");
+      return;
+    }
+  }
+  // Else: noise or not for us — drop silently
+}
 
-  const intent = plaintext[0];
-  const senderSessionPub = plaintext.slice(1, 33);
-  if (ratchet) return; // already in a conversation
+async function handleHandshakePlaintext(pt) {
+  const intent = pt[0];
+  const senderSessionPub = pt.slice(1, 33);
+  if (ratchet) return;
 
   if (intent === 0x00) {
-    // Peer is initiating chat with us. Send reply, then bootstrap.
+    // Peer is initiating with us. Reply, then bootstrap as responder (or as
+    // initiator on tie-break when we also initiated and have greater pubkey).
     const reply = concatU8(new Uint8Array([0x01]), mySessionPubRaw);
-    const replyPayload = await ecesEncrypt(senderSessionPub, reply);
-    ws.send(JSON.stringify({ type: "handshake_broadcast", payload: replyPayload }));
+    const replySlot = await encodeHandshakeSlot(senderSessionPub, reply);
+    sendQueue.push(replySlot);
 
-    // Simultaneous-initiation tie-break: if we also initiated, the side with
-    // greater pubkey becomes initiator (so one side has CKs ready).
     const amInitiator = iInitiated && cmpU8(mySessionPubRaw, senderSessionPub) > 0;
-
     recipientPubRaw = senderSessionPub;
     recipientPubB64 = ab2b64(senderSessionPub);
     document.getElementById("recipientKey").value = recipientPubB64;
@@ -506,7 +616,6 @@ async function handleHandshake(msg) {
       peerPubRaw: senderSessionPub,
     });
   } else if (intent === 0x01) {
-    // We initiated; peer is replying with their session_pub.
     if (!iInitiated) return;
     recipientPubRaw = senderSessionPub;
     recipientPubB64 = ab2b64(senderSessionPub);
@@ -518,29 +627,22 @@ async function handleHandshake(msg) {
   } else {
     return;
   }
-
   document.getElementById("msgInput").disabled = false;
   document.getElementById("sendBtn").disabled = false;
   setHint("recipientHint", "handshake complete — chat is forward-secret end-to-end", "ok");
 }
 
-async function handleMessage(msg) {
-  if (!ratchet) return; // no conversation set up; silently drop broadcast traffic
-  try {
-    const pt = await ratchetDecrypt(ratchet, msg.payload);
-    addMessage(new TextDecoder().decode(pt), "received");
-  } catch {
-    // Not for us, or ratchet desync — drop silently. This is the normal case
-    // for the majority of broadcast traffic once everyone is on one channel.
-  }
-}
-
 async function sendMessage() {
   const input = document.getElementById("msgInput");
   const text  = input.value.trim();
-  if (!text || !ratchet || !ws || ws.readyState !== WebSocket.OPEN) return;
-  const payload = await ratchetEncrypt(ratchet, new TextEncoder().encode(text));
-  ws.send(JSON.stringify({ type: "message", payload }));
+  if (!text || !ratchet) return;
+  const bytes = new TextEncoder().encode(text);
+  if (bytes.length > MAX_MSG_LEN) {
+    addSystem(`⚠ message too long (max ${MAX_MSG_LEN} bytes per slot — chunking not implemented).`);
+    return;
+  }
+  const slot = await encodeRatchetSlot(ratchet, bytes);
+  sendQueue.push(slot);
   addMessage(text, "sent");
   input.value = "";
 }

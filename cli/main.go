@@ -11,7 +11,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
-	"encoding/json"
+	"encoding/binary"
 	"encoding/pem"
 	"flag"
 	"fmt"
@@ -26,31 +26,33 @@ import (
 	"golang.org/x/crypto/hkdf"
 )
 
-// ── Wire types ────────────────────────────────────────────────────────────────
+// ── Slot wire format (Phase 3) ────────────────────────────────────────────────
+//
+// Every WebSocket frame is exactly slotSize bytes of binary. Layout:
+//   [0..32]    pub   — X25519 32B (ratchet DH pub or ECIES ephemeral pub)
+//   [32..44]   iv    — AES-GCM 12B nonce
+//   [44..76]   mac   — HMAC-SHA256 (ratchet) or random (handshake/noise)
+//   [76..1024] ct    — AES-GCM(932B plaintext) → 932 + 16B tag = 948B
+//
+// Plaintext (932B after auth):
+//   [0..2]   msg_len  uint16 BE
+//   [2..6]   pn       uint32 BE
+//   [6..10]  n        uint32 BE
+//   [10..10+msg_len]  msg
+//   [10+msg_len..932] random padding
 
-// Header is the Double-Ratchet message header used in {type:"message"} payloads.
-// Field order matters: HMAC is computed over its canonical JSON encoding, which
-// must match the JS client's JSON.stringify output exactly.
-type Header struct {
-	DH  string `json:"dh"`
-	PN  int    `json:"pn"`
-	N   int    `json:"n"`
-	IV  string `json:"iv"`
-	CT  string `json:"ct"`
-	MAC string `json:"mac,omitempty"`
-}
-
-// HandshakePayload is the ECIES envelope inside a handshake_broadcast.
-type HandshakePayload struct {
-	Eph string `json:"eph"` // base64 ephemeral X25519 pubkey (32B)
-	IV  string `json:"iv"`  // base64 12B AES-GCM nonce
-	CT  string `json:"ct"`  // base64 AES-GCM(plaintext = sender session pub 32B)
-}
-
-type IncomingMessage struct {
-	Type    string          `json:"type"`
-	Payload json.RawMessage `json:"payload"`
-}
+const (
+	slotSize        = 1024
+	slotPubOffset   = 0
+	slotIVOffset    = 32
+	slotMACOffset   = 44
+	slotCTOffset    = 76
+	slotCTSize      = slotSize - slotCTOffset // 948
+	slotPTSize      = slotCTSize - 16          // 932 (AES-GCM tag is 16B)
+	slotMetaSize    = 10                       // 2 + 4 + 4
+	maxMsgLen       = slotPTSize - slotMetaSize // 922
+	slotIntervalMs  = 2000
+)
 
 // ── Ratchet state ────────────────────────────────────────────────────────────
 
@@ -163,12 +165,13 @@ func main() {
 	conn = c
 	defer conn.Close()
 
-	// Phase 2: no `register` — server is a pure broadcaster. Other clients learn
-	// our session_pub via the handshake protocol (ECIES sealed-box).
-	fmt.Println("connected :", *server)
+	// Phase 3: server is a pure 1024-byte slot broadcaster. We emit one slot
+	// every slotInterval (real ciphertext if queued, random noise otherwise).
+	fmt.Printf("connected : %s  (slot=%dB every %dms)\n", *server, slotSize, slotIntervalMs)
 	printHelp()
 
 	go readLoop()
+	go slotScheduler()
 	inputLoop()
 }
 
@@ -373,7 +376,39 @@ func dhRatchetReceiving(r *Ratchet, newDHrRaw []byte) error {
 	return dhRatchetSending(r)
 }
 
-func ratchetEncrypt(r *Ratchet, plaintext []byte) (*Header, error) {
+// packPlaintext fills a 932-byte plaintext block: meta(10B) + msg + random pad.
+func packPlaintext(msg []byte, pn, n uint32) ([]byte, error) {
+	if len(msg) > maxMsgLen {
+		return nil, fmt.Errorf("message too long for one slot (%d > %d)", len(msg), maxMsgLen)
+	}
+	pt := make([]byte, slotPTSize)
+	if _, err := rand.Read(pt); err != nil {
+		return nil, err
+	}
+	binary.BigEndian.PutUint16(pt[0:2], uint16(len(msg)))
+	binary.BigEndian.PutUint32(pt[2:6], pn)
+	binary.BigEndian.PutUint32(pt[6:10], n)
+	copy(pt[slotMetaSize:], msg)
+	return pt, nil
+}
+
+func unpackPlaintext(pt []byte) (msg []byte, pn, n uint32, err error) {
+	if len(pt) != slotPTSize {
+		return nil, 0, 0, fmt.Errorf("bad plaintext size %d", len(pt))
+	}
+	ml := binary.BigEndian.Uint16(pt[0:2])
+	if int(ml) > maxMsgLen {
+		return nil, 0, 0, fmt.Errorf("declared msg_len %d exceeds budget", ml)
+	}
+	pn = binary.BigEndian.Uint32(pt[2:6])
+	n = binary.BigEndian.Uint32(pt[6:10])
+	msg = pt[slotMetaSize : slotMetaSize+int(ml)]
+	return msg, pn, n, nil
+}
+
+// encodeRatchetSlot consumes one chain-key step on the sending side and
+// produces a 1024-byte slot. Mutates r.CKs / r.Ns / r.BurnedMACs.
+func encodeRatchetSlot(r *Ratchet, msg []byte) ([]byte, error) {
 	if r.CKs == nil {
 		return nil, fmt.Errorf("no sending chain (responder must wait for first incoming message)")
 	}
@@ -384,119 +419,38 @@ func ratchetEncrypt(r *Ratchet, plaintext []byte) (*Header, error) {
 	r.CKs = nextCK
 	seq := r.Ns
 	r.Ns++
-	r.BurnedMACs = append(r.BurnedMACs, BurnedMAC{
-		Seq:    seq,
-		MacKey: base64.StdEncoding.EncodeToString(macKey),
-	})
+	r.BurnedMACs = append(r.BurnedMACs, BurnedMAC{Seq: seq, MacKey: base64.StdEncoding.EncodeToString(macKey)})
 
+	pt, err := packPlaintext(msg, uint32(r.PN), uint32(seq))
+	if err != nil {
+		return nil, err
+	}
 	iv := make([]byte, 12)
 	if _, err := rand.Read(iv); err != nil {
 		return nil, err
 	}
-	ct, err := aesGCMEnc(mk, iv, plaintext, nil)
+	ct, err := aesGCMEnc(mk, iv, pt, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	h := &Header{
-		DH: base64.StdEncoding.EncodeToString(r.DHsPubRaw),
-		PN: r.PN,
-		N:  seq,
-		IV: base64.StdEncoding.EncodeToString(iv),
-		CT: base64.StdEncoding.EncodeToString(ct),
-	}
-	macInput, err := canonicalHeaderJSON(h)
-	if err != nil {
-		return nil, err
-	}
+	slot := make([]byte, slotSize)
+	copy(slot[slotPubOffset:slotPubOffset+32], r.DHsPubRaw)
+	copy(slot[slotIVOffset:slotIVOffset+12], iv)
+	copy(slot[slotCTOffset:], ct)
+
+	macInput := make([]byte, 0, 32+12+slotCTSize)
+	macInput = append(macInput, slot[slotPubOffset:slotPubOffset+32]...)
+	macInput = append(macInput, slot[slotIVOffset:slotIVOffset+12]...)
+	macInput = append(macInput, slot[slotCTOffset:]...)
 	mac := hmacSHA256(macKey, macInput)
-	h.MAC = base64.StdEncoding.EncodeToString(mac)
-	return h, nil
+	copy(slot[slotMACOffset:slotMACOffset+32], mac)
+	return slot, nil
 }
 
-func ratchetDecrypt(r *Ratchet, h *Header) ([]byte, error) {
-	incomingDHr, err := base64.StdEncoding.DecodeString(h.DH)
-	if err != nil {
-		return nil, err
-	}
-	if r.DHrRaw == nil || !bytes.Equal(incomingDHr, r.DHrRaw) {
-		if err := dhRatchetReceiving(r, incomingDHr); err != nil {
-			return nil, err
-		}
-	}
-	if r.CKr == nil {
-		return nil, fmt.Errorf("no receiving chain")
-	}
-	var mk, macKey []byte
-	for r.Nr <= h.N {
-		next, m, mac, err := advanceCK(r.CKr)
-		if err != nil {
-			return nil, err
-		}
-		r.CKr = next
-		mk = m
-		macKey = mac
-		r.Nr++
-		if r.Nr-1 == h.N {
-			break
-		}
-	}
-	if r.Nr-1 != h.N {
-		return nil, fmt.Errorf("ratchet desync")
-	}
-	hc := *h
-	hc.MAC = ""
-	macInput, err := canonicalHeaderJSON(&hc)
-	if err != nil {
-		return nil, err
-	}
-	expected := hmacSHA256(macKey, macInput)
-	gotMac, err := base64.StdEncoding.DecodeString(h.MAC)
-	if err != nil {
-		return nil, err
-	}
-	if !hmac.Equal(expected, gotMac) {
-		return nil, fmt.Errorf("mac mismatch")
-	}
-	iv, err := base64.StdEncoding.DecodeString(h.IV)
-	if err != nil {
-		return nil, err
-	}
-	ct, err := base64.StdEncoding.DecodeString(h.CT)
-	if err != nil {
-		return nil, err
-	}
-	return aesGCMDec(mk, iv, ct, nil)
-}
-
-// canonicalHeaderJSON produces the exact bytes that JS's
-// JSON.stringify({dh, pn, n, iv, ct}) produces, so HMAC is interoperable.
-func canonicalHeaderJSON(h *Header) ([]byte, error) {
-	// Match JS field order and lack of whitespace; integers without decimals;
-	// base64 strings contain no characters that need escaping beyond '+/=' which
-	// JSON treats literally. Use json.Marshal on a struct with explicit order.
-	type canon struct {
-		DH string `json:"dh"`
-		PN int    `json:"pn"`
-		N  int    `json:"n"`
-		IV string `json:"iv"`
-		CT string `json:"ct"`
-	}
-	return json.Marshal(canon{DH: h.DH, PN: h.PN, N: h.N, IV: h.IV, CT: h.CT})
-}
-
-// ── Handshake (ECIES sealed-box, mutual 2-step) ─────────────────────────────
-//
-// Plaintext format (33 bytes after AES-GCM decrypt):
-//   byte[0]     = intent  (0x00 = init / 0x01 = reply)
-//   byte[1..33] = sender's session pubkey (32B raw)
-//
-// Flow:
-//   /find <pub>      → send init handshake (encrypted to <pub>)
-//   recv init        → send reply + bootstrap ratchet as responder
-//   recv reply       → bootstrap ratchet as initiator (we initiated)
-
-func ecesEncrypt(recipientPubRaw, plaintext []byte) (*HandshakePayload, error) {
+// encodeHandshakeSlot produces an ECIES sealed-box slot. The mac field is
+// random so the slot is indistinguishable from a ratchet slot on the wire.
+func encodeHandshakeSlot(recipientPubRaw, msg []byte) ([]byte, error) {
 	eph, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
 		return nil, err
@@ -509,44 +463,115 @@ func ecesEncrypt(recipientPubRaw, plaintext []byte) (*HandshakePayload, error) {
 	if err != nil {
 		return nil, err
 	}
+	pt, err := packPlaintext(msg, 0, 0)
+	if err != nil {
+		return nil, err
+	}
 	iv := make([]byte, 12)
 	if _, err := rand.Read(iv); err != nil {
 		return nil, err
 	}
-	ct, err := aesGCMEnc(key, iv, plaintext, nil)
+	ct, err := aesGCMEnc(key, iv, pt, nil)
 	if err != nil {
 		return nil, err
 	}
-	return &HandshakePayload{
-		Eph: base64.StdEncoding.EncodeToString(eph.PublicKey().Bytes()),
-		IV:  base64.StdEncoding.EncodeToString(iv),
-		CT:  base64.StdEncoding.EncodeToString(ct),
-	}, nil
+	slot := make([]byte, slotSize)
+	copy(slot[slotPubOffset:slotPubOffset+32], eph.PublicKey().Bytes())
+	copy(slot[slotIVOffset:slotIVOffset+12], iv)
+	if _, err := rand.Read(slot[slotMACOffset : slotMACOffset+32]); err != nil {
+		return nil, err
+	}
+	copy(slot[slotCTOffset:], ct)
+	return slot, nil
 }
 
-func ecesDecrypt(privKey *ecdh.PrivateKey, p *HandshakePayload) ([]byte, error) {
-	ephRaw, err := base64.StdEncoding.DecodeString(p.Eph)
+// tryEciesDecryptSlot returns the inner message bytes if `priv` can decrypt the
+// slot's ECIES envelope; otherwise nil. Stateless.
+func tryEciesDecryptSlot(priv *ecdh.PrivateKey, slot []byte) []byte {
+	pub := slot[slotPubOffset : slotPubOffset+32]
+	iv := slot[slotIVOffset : slotIVOffset+12]
+	ct := slot[slotCTOffset:]
+	dhOut, err := dhX25519(priv, pub)
 	if err != nil {
-		return nil, err
-	}
-	iv, err := base64.StdEncoding.DecodeString(p.IV)
-	if err != nil {
-		return nil, err
-	}
-	ct, err := base64.StdEncoding.DecodeString(p.CT)
-	if err != nil {
-		return nil, err
-	}
-	dhOut, err := dhX25519(privKey, ephRaw)
-	if err != nil {
-		return nil, err
+		return nil
 	}
 	key, err := hkdfDerive(dhOut, make([]byte, 32), hsInfo, 32)
 	if err != nil {
-		return nil, err
+		return nil
 	}
-	return aesGCMDec(key, iv, ct, nil)
+	pt, err := aesGCMDec(key, iv, ct, nil)
+	if err != nil {
+		return nil
+	}
+	msg, _, _, err := unpackPlaintext(pt)
+	if err != nil {
+		return nil
+	}
+	return append([]byte{}, msg...)
 }
+
+// tryRatchetDecryptSlot snapshots ratchet state, attempts a receive step, and
+// commits only on full success (MAC verify + AES-GCM decrypt). Returns the
+// message bytes on success, nil otherwise.
+func tryRatchetDecryptSlot(r *Ratchet, slot []byte) []byte {
+	pub := slot[slotPubOffset : slotPubOffset+32]
+	iv := slot[slotIVOffset : slotIVOffset+12]
+	mac := slot[slotMACOffset : slotMACOffset+32]
+	ct := slot[slotCTOffset:]
+
+	saved := *r
+	saved.BurnedMACs = append([]BurnedMAC(nil), r.BurnedMACs...)
+	commit := false
+	defer func() {
+		if !commit {
+			*r = saved
+		}
+	}()
+
+	if r.DHrRaw == nil || !bytes.Equal(pub, r.DHrRaw) {
+		if err := dhRatchetReceiving(r, pub); err != nil {
+			return nil
+		}
+	}
+	if r.CKr == nil {
+		return nil
+	}
+	nextCK, mk, macKey, err := advanceCK(r.CKr)
+	if err != nil {
+		return nil
+	}
+	r.CKr = nextCK
+	r.Nr++
+
+	macInput := make([]byte, 0, 32+12+slotCTSize)
+	macInput = append(macInput, pub...)
+	macInput = append(macInput, iv...)
+	macInput = append(macInput, ct...)
+	expected := hmacSHA256(macKey, macInput)
+	if !hmac.Equal(expected, mac) {
+		return nil
+	}
+	pt, err := aesGCMDec(mk, iv, ct, nil)
+	if err != nil {
+		return nil
+	}
+	msg, _, _, err := unpackPlaintext(pt)
+	if err != nil {
+		return nil
+	}
+	commit = true
+	return append([]byte{}, msg...)
+}
+
+// ── Handshake (ECIES sealed-box, mutual 2-step over slot wire format) ───────
+//
+// Handshake plaintext = 33 bytes:  [intent_byte] || [sender session pub 32B]
+//   intent = 0x00 (init) | 0x01 (reply)
+//
+// Flow:
+//   /find <pub>  → enqueue init handshake slot encrypted to <pub>
+//   recv init    → enqueue reply slot + bootstrap ratchet as responder
+//   recv reply   → bootstrap ratchet as initiator
 
 func broadcastHandshake(peerPubB64 string) error {
 	peerPubRaw, err := base64.StdEncoding.DecodeString(peerPubB64)
@@ -556,47 +581,27 @@ func broadcastHandshake(peerPubB64 string) error {
 	if len(peerPubRaw) != 32 {
 		return fmt.Errorf("pubkey must be 32 bytes (got %d)", len(peerPubRaw))
 	}
-	plaintext := append([]byte{0x00}, sessionPubRaw...) // init
-	payload, err := ecesEncrypt(peerPubRaw, plaintext)
+	plaintext := append([]byte{0x00}, sessionPubRaw...)
+	slot, err := encodeHandshakeSlot(peerPubRaw, plaintext)
 	if err != nil {
 		return err
 	}
-	return sendJSON(map[string]any{
-		"type":    "handshake_broadcast",
-		"payload": payload,
-	})
+	enqueueSlot(slot)
+	return nil
 }
 
-func handleHandshake(msg IncomingMessage) {
-	var p HandshakePayload
-	if err := json.Unmarshal(msg.Payload, &p); err != nil {
-		return
-	}
-
-	// Try to decrypt with session_priv first; if that fails, try identity_priv.
-	// Session-keyed handshakes arrive when a peer is replying (they learned our
-	// session pub via our own outgoing handshake) or initiating to our session
-	// pub (e.g. from a web client we shared session pub with). Identity-keyed
-	// handshakes arrive when a peer initiated with our out-of-band identity pub.
-	var plaintext []byte
-	var err error
-	plaintext, err = ecesDecrypt(sessionPriv, &p)
-	if err != nil && identityPriv != nil {
-		plaintext, err = ecesDecrypt(identityPriv, &p)
-	}
-	if err != nil {
-		return // not for us
-	}
+// handleHandshakePlaintext consumes a decrypted 33-byte handshake payload and
+// either replies + bootstraps as responder, or bootstraps as initiator. Called
+// after tryEciesDecryptSlot succeeds for an incoming slot.
+func handleHandshakePlaintext(plaintext []byte) {
 	if len(plaintext) != 33 {
 		return
 	}
-
 	intent := plaintext[0]
 	senderPub := plaintext[1:33]
 	senderPubB64 := base64.StdEncoding.EncodeToString(senderPub)
 
 	contactsMu.Lock()
-	// De-dupe: if we already have a contact for this peer session_pub, reuse it
 	var c *Contact
 	for _, k := range contacts {
 		if k.SessionKeyB64 == senderPubB64 {
@@ -612,20 +617,19 @@ func handleHandshake(msg IncomingMessage) {
 	}
 	if c.R != nil {
 		contactsMu.Unlock()
-		return // already bootstrapped; ignore duplicate handshake
+		return
 	}
 	contactsMu.Unlock()
 
 	switch intent {
-	case 0x00: // init — peer is reaching out. Reply and bootstrap as responder.
+	case 0x00:
 		reply := append([]byte{0x01}, sessionPubRaw...)
-		replyPayload, err := ecesEncrypt(senderPub, reply)
+		replySlot, err := encodeHandshakeSlot(senderPub, reply)
 		if err != nil {
 			printLine("[⚠ handshake reply failed: " + err.Error() + "]")
 			return
 		}
-		_ = sendJSON(map[string]any{"type": "handshake_broadcast", "payload": replyPayload})
-
+		enqueueSlot(replySlot)
 		r, err := ratchetInit(false, sessionPriv, senderPub)
 		if err != nil {
 			printLine("[⚠ ratchet init failed: " + err.Error() + "]")
@@ -636,8 +640,7 @@ func handleHandshake(msg IncomingMessage) {
 		activeContact = c
 		contactsMu.Unlock()
 		printLine(fmt.Sprintf("[!] incoming handshake → contact #%d (now active)", c.ID))
-
-	case 0x01: // reply — we initiated. Bootstrap as initiator.
+	case 0x01:
 		r, err := ratchetInit(true, sessionPriv, senderPub)
 		if err != nil {
 			printLine("[⚠ ratchet init failed: " + err.Error() + "]")
@@ -651,13 +654,21 @@ func handleHandshake(msg IncomingMessage) {
 	}
 }
 
-// ── Message handler — trial-decrypt against every contact's ratchet ─────────
-
-func handleMessage(msg IncomingMessage) {
-	var h Header
-	if err := json.Unmarshal(msg.Payload, &h); err != nil {
+// handleSlot routes an incoming binary slot: trial-decrypt as ECIES (handshake)
+// first against session_priv + identity_priv, then as ratchet against every
+// active contact. Failures are silent — most slots are noise or not for us.
+func handleSlot(slot []byte) {
+	if pt := tryEciesDecryptSlot(sessionPriv, slot); pt != nil {
+		handleHandshakePlaintext(pt)
 		return
 	}
+	if identityPriv != nil {
+		if pt := tryEciesDecryptSlot(identityPriv, slot); pt != nil {
+			handleHandshakePlaintext(pt)
+			return
+		}
+	}
+
 	contactsMu.Lock()
 	candidates := make([]*Contact, 0, len(contacts))
 	for _, c := range contacts {
@@ -668,23 +679,13 @@ func handleMessage(msg IncomingMessage) {
 	contactsMu.Unlock()
 
 	for _, c := range candidates {
-		// ratchetDecrypt mutates c.R; on failure, the ratchet state isn't
-		// committed because dhRatchetReceiving runs only if DHr changes, and
-		// the chain key advance happens inside the loop after MAC verification.
-		// To avoid corrupting a ratchet on a wrong-peer attempt, we snapshot
-		// and restore on failure.
-		snapshot := *c.R
-		snapBurned := append([]BurnedMAC(nil), c.R.BurnedMACs...)
-		pt, err := ratchetDecrypt(c.R, &h)
-		if err == nil {
+		if msg := tryRatchetDecryptSlot(c.R, slot); msg != nil {
 			ts := time.Now().Format("15:04")
-			printLine(fmt.Sprintf("[%s] [#%d] %s", ts, c.ID, string(pt)))
+			printLine(fmt.Sprintf("[%s] [#%d] %s", ts, c.ID, string(msg)))
 			return
 		}
-		*c.R = snapshot
-		c.R.BurnedMACs = snapBurned
 	}
-	// All contacts failed → silently drop (message wasn't for us)
+	// Not for us — silently drop
 }
 
 func sendChatMessage(text string) {
@@ -696,38 +697,73 @@ func sendChatMessage(text string) {
 		fmt.Println("[handshake not complete yet — wait for the peer to come online]")
 		return
 	}
-	h, err := ratchetEncrypt(activeContact.R, []byte(text))
+	if len(text) > maxMsgLen {
+		fmt.Printf("[message too long: %d > %d bytes per slot — chunking not implemented]\n", len(text), maxMsgLen)
+		return
+	}
+	slot, err := encodeRatchetSlot(activeContact.R, []byte(text))
 	if err != nil {
 		fmt.Println("[⚠ encrypt failed:", err, "]")
 		return
 	}
-	sendJSON(map[string]any{
-		"type":    "message",
-		"payload": h,
-	})
+	enqueueSlot(slot)
 	ts := time.Now().Format("15:04")
 	fmt.Printf("[%s] [me→#%d] %s\n", ts, activeContact.ID, text)
+}
+
+// ── Slot scheduler + send queue ─────────────────────────────────────────────
+//
+// Constant-rate broadcast: every slotInterval, the scheduler pops one slot
+// from the queue and writes it to the WebSocket; if the queue is empty, it
+// emits a slot of pure random bytes. Real and noise are indistinguishable.
+
+var sendQueue = make(chan []byte, 64)
+
+func enqueueSlot(slot []byte) {
+	select {
+	case sendQueue <- slot:
+	default:
+		// Queue full — drop to avoid blocking the caller. With slotInterval=2s
+		// and capacity 64 this should never happen in normal use.
+		printLine("[⚠ send queue full, dropping slot]")
+	}
+}
+
+func slotScheduler() {
+	ticker := time.NewTicker(time.Duration(slotIntervalMs) * time.Millisecond)
+	defer ticker.Stop()
+	for range ticker.C {
+		var slot []byte
+		select {
+		case slot = <-sendQueue:
+		default:
+			slot = make([]byte, slotSize)
+			if _, err := rand.Read(slot); err != nil {
+				continue
+			}
+		}
+		connMu.Lock()
+		err := conn.WriteMessage(websocket.BinaryMessage, slot)
+		connMu.Unlock()
+		if err != nil {
+			return
+		}
+	}
 }
 
 // ── WebSocket I/O ───────────────────────────────────────────────────────────
 
 func readLoop() {
 	for {
-		_, data, err := conn.ReadMessage()
+		mt, data, err := conn.ReadMessage()
 		if err != nil {
 			fmt.Println("\n[disconnected]")
 			os.Exit(0)
 		}
-		var msg IncomingMessage
-		if err := json.Unmarshal(data, &msg); err != nil {
+		if mt != websocket.BinaryMessage || len(data) != slotSize {
 			continue
 		}
-		switch msg.Type {
-		case "handshake_broadcast":
-			handleHandshake(msg)
-		case "message":
-			handleMessage(msg)
-		}
+		handleSlot(data)
 	}
 }
 
@@ -809,16 +845,6 @@ func handleCommand(line string) {
 }
 
 // ── Utilities ───────────────────────────────────────────────────────────────
-
-func sendJSON(v any) error {
-	data, err := json.Marshal(v)
-	if err != nil {
-		return err
-	}
-	connMu.Lock()
-	defer connMu.Unlock()
-	return conn.WriteMessage(websocket.TextMessage, data)
-}
 
 func printLine(s string) { fmt.Printf("\r%s\n> ", s) }
 
