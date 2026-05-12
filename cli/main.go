@@ -12,6 +12,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"encoding/pem"
 	"flag"
 	"fmt"
@@ -52,6 +53,13 @@ const (
 	slotMetaSize    = 10                       // 2 + 4 + 4
 	maxMsgLen       = slotPTSize - slotMetaSize // 922
 	slotIntervalMs  = 2000
+
+	// Inner message-type byte (Phase 4 wire format)
+	msgTypeChat = 0x01
+	msgTypeBurn = 0x02
+
+	burnEntrySize    = 34
+	maxBurnEntries   = (maxMsgLen - 3) / burnEntrySize // 27
 )
 
 // ── Ratchet state ────────────────────────────────────────────────────────────
@@ -85,10 +93,12 @@ type BurnedMAC struct {
 
 // Contact holds a peer's identity and current ratchet state.
 type Contact struct {
-	ID            int
-	SessionKeyB64 string // peer's session pub (base64)
-	SessionPubRaw []byte // 32B
-	R             *Ratchet
+	ID             int
+	SessionKeyB64  string // peer's session pub (base64)
+	SessionPubRaw  []byte // 32B
+	R              *Ratchet
+	Burned         bool       // conversation burned (sent or received); no more sends
+	PeerBurnedMACs []BurnedMAC // mac keys peer published in their burn message
 }
 
 // ── Global state ─────────────────────────────────────────────────────────────
@@ -680,12 +690,43 @@ func handleSlot(slot []byte) {
 
 	for _, c := range candidates {
 		if msg := tryRatchetDecryptSlot(c.R, slot); msg != nil {
-			ts := time.Now().Format("15:04")
-			printLine(fmt.Sprintf("[%s] [#%d] %s", ts, c.ID, string(msg)))
+			dispatchRatchetMessage(c, msg)
 			return
 		}
 	}
 	// Not for us — silently drop
+}
+
+// Inner type-byte dispatch (Phase 4 wire format).
+func dispatchRatchetMessage(c *Contact, bytes []byte) {
+	if len(bytes) < 1 {
+		return
+	}
+	ts := time.Now().Format("15:04")
+	switch bytes[0] {
+	case msgTypeChat:
+		printLine(fmt.Sprintf("[%s] [#%d] %s", ts, c.ID, string(bytes[1:])))
+	case msgTypeBurn:
+		if len(bytes) < 3 {
+			return
+		}
+		count := binary.BigEndian.Uint16(bytes[1:3])
+		if int(count) > maxBurnEntries || 3+int(count)*burnEntrySize > len(bytes) {
+			return
+		}
+		entries := make([]BurnedMAC, 0, count)
+		for i := 0; i < int(count); i++ {
+			off := 3 + i*burnEntrySize
+			seq := binary.BigEndian.Uint16(bytes[off : off+2])
+			macKey := base64.StdEncoding.EncodeToString(bytes[off+2 : off+2+32])
+			entries = append(entries, BurnedMAC{Seq: int(seq), MacKey: macKey})
+		}
+		contactsMu.Lock()
+		c.PeerBurnedMACs = entries
+		c.Burned = true
+		contactsMu.Unlock()
+		printLine(fmt.Sprintf("[🔥 #%d peer burned the conversation — %d mac key(s) received. Transcript now publicly forgeable. Read-only.]", c.ID, count))
+	}
 }
 
 func sendChatMessage(text string) {
@@ -697,11 +738,16 @@ func sendChatMessage(text string) {
 		fmt.Println("[handshake not complete yet — wait for the peer to come online]")
 		return
 	}
-	if len(text) > maxMsgLen {
-		fmt.Printf("[message too long: %d > %d bytes per slot — chunking not implemented]\n", len(text), maxMsgLen)
+	if activeContact.Burned {
+		fmt.Println("[conversation burned — read-only]")
 		return
 	}
-	slot, err := encodeRatchetSlot(activeContact.R, []byte(text))
+	inner := append([]byte{msgTypeChat}, []byte(text)...)
+	if len(inner) > maxMsgLen {
+		fmt.Printf("[message too long: %d > %d bytes per slot — chunking not implemented]\n", len(inner), maxMsgLen-1)
+		return
+	}
+	slot, err := encodeRatchetSlot(activeContact.R, inner)
 	if err != nil {
 		fmt.Println("[⚠ encrypt failed:", err, "]")
 		return
@@ -709,6 +755,84 @@ func sendChatMessage(text string) {
 	enqueueSlot(slot)
 	ts := time.Now().Format("15:04")
 	fmt.Printf("[%s] [me→#%d] %s\n", ts, activeContact.ID, text)
+}
+
+// burnConversation publishes recent macKeys of the active contact's outgoing
+// chain. The chat is then locked. Local mac keys remain; manifest can be
+// exported via /manifest <path>.
+func burnConversation() {
+	if activeContact == nil {
+		fmt.Println("[no active contact]")
+		return
+	}
+	if activeContact.R == nil {
+		fmt.Println("[handshake not complete yet]")
+		return
+	}
+	if activeContact.Burned {
+		fmt.Println("[already burned]")
+		return
+	}
+	if activeContact.R.CKs == nil || len(activeContact.R.BurnedMACs) == 0 {
+		fmt.Println("[no sent messages to burn — send at least one chat message first]")
+		return
+	}
+
+	all := activeContact.R.BurnedMACs
+	start := 0
+	if len(all) > maxBurnEntries {
+		start = len(all) - maxBurnEntries
+	}
+	entries := all[start:]
+
+	inner := make([]byte, 3+len(entries)*burnEntrySize)
+	inner[0] = msgTypeBurn
+	binary.BigEndian.PutUint16(inner[1:3], uint16(len(entries)))
+	for i, e := range entries {
+		off := 3 + i*burnEntrySize
+		binary.BigEndian.PutUint16(inner[off:off+2], uint16(e.Seq))
+		macKey, err := base64.StdEncoding.DecodeString(e.MacKey)
+		if err != nil || len(macKey) != 32 {
+			fmt.Println("[⚠ stored mac key malformed]")
+			return
+		}
+		copy(inner[off+2:off+2+32], macKey)
+	}
+	slot, err := encodeRatchetSlot(activeContact.R, inner)
+	if err != nil {
+		fmt.Println("[⚠ burn encrypt failed:", err, "]")
+		return
+	}
+	enqueueSlot(slot)
+	activeContact.Burned = true
+	fmt.Printf("[🔥 burn queued — %d of your mac keys will be published. Conversation is now read-only.]\n", len(entries))
+}
+
+func writeManifest(path string) {
+	if activeContact == nil || activeContact.R == nil {
+		fmt.Println("[no active conversation to export]")
+		return
+	}
+	mine := make([]BurnedMAC, 0, len(activeContact.R.BurnedMACs))
+	for _, e := range activeContact.R.BurnedMACs {
+		mine = append(mine, BurnedMAC{Seq: e.Seq, MacKey: e.MacKey})
+	}
+	manifest := map[string]any{
+		"burnedAt": time.Now().UTC().Format(time.RFC3339),
+		"contact":  activeContact.SessionKeyB64,
+		"note":     "These MAC keys can forge messages authenticating against this conversation's HMAC chain. The transcript is no longer a reliable record.",
+		"mySent":   mine,
+		"peerSent": activeContact.PeerBurnedMACs,
+	}
+	if path == "" {
+		path = fmt.Sprintf("tacenda-burn-%d.json", time.Now().Unix())
+	}
+	data, _ := json.MarshalIndent(manifest, "", "  ")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		fmt.Println("[⚠ manifest write failed:", err, "]")
+		return
+	}
+	fmt.Printf("[manifest written: %s  (%d mine, %d peer)]\n", path, len(mine), len(activeContact.PeerBurnedMACs))
 }
 
 // ── Slot scheduler + send queue ─────────────────────────────────────────────
@@ -833,6 +957,14 @@ func handleCommand(line string) {
 		contactsMu.Unlock()
 	case "/mykey":
 		fmt.Println(sessionPubB64)
+	case "/burn":
+		burnConversation()
+	case "/manifest":
+		path := ""
+		if len(parts) >= 2 {
+			path = parts[1]
+		}
+		writeManifest(path)
 	case "/help":
 		printHelp()
 	case "/quit":
@@ -863,6 +995,8 @@ commands:
   /chat <n>                   switch active contact
   /contacts                   list all known contacts (* = active)
   /mykey                      print your current session public key
+  /burn                       publish your past mac keys; locks the chat (deniable transcript)
+  /manifest [path]            export burn manifest (your mac keys + peer's) to JSON
   /help                       show this help
   /quit                       exit
   <anything else>             send encrypted message to active contact

@@ -96,6 +96,12 @@
       color: #6fcf6f;
     }
     button.primary:hover:not(:disabled) { background: #1a2e1a; }
+    #burnBtn {
+      background: #221313;
+      border-color: #4a2a2a;
+      color: #cf6f6f;
+    }
+    #burnBtn:hover:not(:disabled) { background: #2e1a1a; }
 
     .hint {
       font-size: 0.68rem;
@@ -177,6 +183,8 @@
   <div id="sendBar">
     <input id="msgInput" type="text" placeholder="type a message… (Enter to send)" disabled />
     <button class="primary" id="sendBtn" onclick="sendMessage()" disabled>send</button>
+    <button id="burnBtn" onclick="burnConversation()" disabled title="publish past MAC keys so the transcript becomes forgeable; locks the chat">burn</button>
+    <button id="exportBtn" onclick="exportManifest()" style="display:none" title="download all known MAC keys as JSON">export</button>
   </div>
 
 <script>
@@ -188,6 +196,8 @@ let recipientPubRaw   = null;     // Uint8Array(32)
 let recipientPubB64   = null;
 let ratchet           = null;     // active Double Ratchet state
 let iInitiated       = false;     // true if user pasted peer's pub (we sent init handshake)
+let conversationBurned = false;   // true after burn (sent or received); chat is read-only
+let peerBurnedMACs   = [];        // [{seq, macKey(b64)}] received from peer's burn message
 let ws                = null;
 
 // ─── Base64 helpers ───────────────────────────────────────────────────────────
@@ -303,6 +313,14 @@ const SLOT_PT_SIZE = SLOT_CT_SIZE - 16;          // 932 (AES-GCM tag is 16B)
 const SLOT_META_SIZE = 10;                        // 2 + 4 + 4
 const MAX_MSG_LEN = SLOT_PT_SIZE - SLOT_META_SIZE; // 922
 const SLOT_INTERVAL_MS = 2000;
+
+// Inner message types (first byte of the msg field after ratchet/ECIES decrypt).
+// Handshake plaintext (33B) is NOT prefixed — it lives at the ECIES layer.
+const MSG_TYPE_CHAT = 0x01;
+const MSG_TYPE_BURN = 0x02;
+// Each burn entry = 2B seq + 32B macKey. Header = 1B type + 2B count.
+const BURN_ENTRY_SIZE = 34;
+const MAX_BURN_ENTRIES = Math.floor((MAX_MSG_LEN - 3) / BURN_ENTRY_SIZE); // 27
 
 // Pack arbitrary message bytes (length ≤ 922) into a 932-byte plaintext block,
 // padded with random bytes so that ciphertext length is always 948.
@@ -541,6 +559,7 @@ async function init() {
     addSystem("disconnected — all keys destroyed.");
     document.getElementById("msgInput").disabled = true;
     document.getElementById("sendBtn").disabled = true;
+    document.getElementById("burnBtn").disabled = true;
   };
 }
 
@@ -576,23 +595,44 @@ async function setRecipient(keyB64Override) {
 }
 
 // Single slot handler: trial-decrypt as ECIES first (handshake?), then ratchet
-// (message?). Failures are silent — most slots are noise or not for us.
+// (chat / burn). Failures are silent — most slots are noise or not for us.
 async function handleSlot(slot) {
-  // Handshake path
   const hsPt = await tryEciesDecrypt(mySessionKeyPair.privateKey, slot);
   if (hsPt && hsPt.length === 33) {
     await handleHandshakePlaintext(hsPt);
     return;
   }
-  // Message path
   if (ratchet) {
     const msgBytes = await tryRatchetDecrypt(ratchet, slot);
     if (msgBytes) {
-      addMessage(new TextDecoder().decode(msgBytes), "received");
+      await dispatchRatchetMessage(msgBytes);
       return;
     }
   }
-  // Else: noise or not for us — drop silently
+  // Noise or not for us — drop silently
+}
+
+// Branch on the inner message-type byte (Phase 4 wire format).
+async function dispatchRatchetMessage(bytes) {
+  if (bytes.length < 1) return;
+  const type = bytes[0];
+  if (type === MSG_TYPE_CHAT) {
+    const text = new TextDecoder().decode(bytes.subarray(1));
+    addMessage(text, "received");
+  } else if (type === MSG_TYPE_BURN) {
+    if (bytes.length < 3) return;
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const count = dv.getUint16(1, false);
+    if (count > MAX_BURN_ENTRIES || 3 + count * BURN_ENTRY_SIZE > bytes.length) return;
+    peerBurnedMACs = [];
+    for (let i = 0; i < count; i++) {
+      const off = 3 + i * BURN_ENTRY_SIZE;
+      const seq = dv.getUint16(off, false);
+      const macKey = bytes.subarray(off + 2, off + 2 + 32);
+      peerBurnedMACs.push({ seq, macKey: ab2b64(macKey) });
+    }
+    lockConversation(`🔥 peer burned this conversation — ${count} MAC key${count === 1 ? "" : "s"} received. Transcript is now publicly forgeable.`);
+  }
 }
 
 async function handleHandshakePlaintext(pt) {
@@ -629,22 +669,86 @@ async function handleHandshakePlaintext(pt) {
   }
   document.getElementById("msgInput").disabled = false;
   document.getElementById("sendBtn").disabled = false;
+  document.getElementById("burnBtn").disabled = false;
   setHint("recipientHint", "handshake complete — chat is forward-secret end-to-end", "ok");
 }
 
 async function sendMessage() {
   const input = document.getElementById("msgInput");
   const text  = input.value.trim();
-  if (!text || !ratchet) return;
-  const bytes = new TextEncoder().encode(text);
-  if (bytes.length > MAX_MSG_LEN) {
-    addSystem(`⚠ message too long (max ${MAX_MSG_LEN} bytes per slot — chunking not implemented).`);
+  if (!text || !ratchet || conversationBurned) return;
+  const textBytes = new TextEncoder().encode(text);
+  const inner = new Uint8Array(1 + textBytes.length);
+  inner[0] = MSG_TYPE_CHAT;
+  inner.set(textBytes, 1);
+  if (inner.length > MAX_MSG_LEN) {
+    addSystem(`⚠ message too long (max ${MAX_MSG_LEN - 1} bytes per slot — chunking not implemented).`);
     return;
   }
-  const slot = await encodeRatchetSlot(ratchet, bytes);
+  const slot = await encodeRatchetSlot(ratchet, inner);
   sendQueue.push(slot);
   addMessage(text, "sent");
   input.value = "";
+}
+
+async function burnConversation() {
+  if (!ratchet || conversationBurned) return;
+  if (!ratchet.CKs) {
+    addSystem("⚠ can't burn yet — no messages have been sent on this side. Send a message first, then try again.");
+    return;
+  }
+  if (!confirm(
+    "Burn this conversation?\n\n" +
+    "This publishes the MAC keys of your sent messages. Anyone with the chat transcript can then forge fake messages that look like they came from you. The chat will be locked read-only.\n\n" +
+    "This is irreversible."
+  )) return;
+
+  const entries = ratchet.burnedMACs.slice(-MAX_BURN_ENTRIES);
+  const inner = new Uint8Array(3 + entries.length * BURN_ENTRY_SIZE);
+  inner[0] = MSG_TYPE_BURN;
+  const dv = new DataView(inner.buffer);
+  dv.setUint16(1, entries.length, false);
+  for (let i = 0; i < entries.length; i++) {
+    const off = 3 + i * BURN_ENTRY_SIZE;
+    dv.setUint16(off, entries[i].seq, false);
+    inner.set(entries[i].macKey, off + 2);
+  }
+  const slot = await encodeRatchetSlot(ratchet, inner);
+  sendQueue.push(slot);
+  lockConversation(`🔥 you burned this conversation — ${entries.length} of your MAC key${entries.length === 1 ? "" : "s"} queued for broadcast.`);
+}
+
+function lockConversation(reason) {
+  if (conversationBurned) return;
+  conversationBurned = true;
+  document.getElementById("msgInput").disabled = true;
+  document.getElementById("sendBtn").disabled = true;
+  const burnBtn = document.getElementById("burnBtn");
+  if (burnBtn) burnBtn.disabled = true;
+  const exportBtn = document.getElementById("exportBtn");
+  if (exportBtn) exportBtn.style.display = "";
+  addSystem(reason);
+}
+
+function exportManifest() {
+  if (!ratchet) return;
+  const mySent = (ratchet.burnedMACs || []).map(e => ({
+    seq: e.seq,
+    macKey: typeof e.macKey === "string" ? e.macKey : ab2b64(e.macKey),
+  }));
+  const manifest = {
+    burnedAt: new Date().toISOString(),
+    note: "These MAC keys can be used to forge messages that authenticate against this conversation's HMAC chain. The transcript is no longer a reliable record of who said what.",
+    mySent,
+    peerSent: peerBurnedMACs,
+  };
+  const blob = new Blob([JSON.stringify(manifest, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "tacenda-burn-manifest.json";
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 function addMessage(text, type) {
