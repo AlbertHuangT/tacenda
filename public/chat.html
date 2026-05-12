@@ -173,7 +173,7 @@
     <label>Recipient's public key &nbsp;—&nbsp; paste what they shared with you</label>
     <div class="row">
       <textarea id="recipientKey" rows="3" placeholder="paste their public key here…"></textarea>
-      <button id="setBtn" onclick="setRecipient()">set</button>
+      <button id="setBtn" onclick="withRatchet(setRecipient)">set</button>
     </div>
     <div id="recipientHint" class="hint muted"></div>
   </div>
@@ -182,9 +182,9 @@
 
   <div id="sendBar">
     <input id="msgInput" type="text" placeholder="type a message… (Enter to send)" disabled />
-    <button class="primary" id="sendBtn" onclick="sendMessage()" disabled>send</button>
-    <button id="burnBtn" onclick="burnConversation()" disabled title="publish past MAC keys so the transcript becomes forgeable; locks the chat">burn</button>
-    <button id="exportBtn" onclick="exportManifest()" style="display:none" title="download all known MAC keys as JSON">export</button>
+    <button class="primary" id="sendBtn" onclick="withRatchet(sendMessage)" disabled>send</button>
+    <button id="burnBtn" onclick="withRatchet(burnConversation)" disabled title="publish mk + macKey for past messages; transcript becomes decryptable and forgeable; locks the chat">burn</button>
+    <button id="exportBtn" onclick="exportManifest()" style="display:none" title="download all known keys as JSON">export</button>
   </div>
 
 <script>
@@ -318,9 +318,12 @@ const SLOT_INTERVAL_MS = 2000;
 // Handshake plaintext (33B) is NOT prefixed — it lives at the ECIES layer.
 const MSG_TYPE_CHAT = 0x01;
 const MSG_TYPE_BURN = 0x02;
-// Each burn entry = 2B seq + 32B macKey. Header = 1B type + 2B count.
-const BURN_ENTRY_SIZE = 34;
-const MAX_BURN_ENTRIES = Math.floor((MAX_MSG_LEN - 3) / BURN_ENTRY_SIZE); // 27
+// Each burn entry = 4B seq (uint32 BE, widened to avoid wrap on long chains)
+// + 32B mk + 32B macKey = 68B. Header = 1B type + 2B count. Publishing both
+// keys is what actually enables transcript forgery — see burnConversation
+// comment for the FS trade-off.
+const BURN_ENTRY_SIZE = 68;
+const MAX_BURN_ENTRIES = Math.floor((MAX_MSG_LEN - 3) / BURN_ENTRY_SIZE); // 13
 
 // Pack arbitrary message bytes (length ≤ 922) into a 932-byte plaintext block,
 // padded with random bytes so that ciphertext length is always 948.
@@ -416,7 +419,10 @@ async function encodeRatchetSlot(state, msgU8) {
   state.CKs = step.nextCK;
   const seq = state.Ns;
   state.Ns += 1;
-  state.burnedMACs.push({ seq, macKey: step.macKey });
+  // Record both mk and macKey for burn. Publishing macKey alone would not
+  // enable forgery because the AES-GCM auth tag is keyed by mk — recipient
+  // would still reject any forged ciphertext.
+  state.burnedMACs.push({ seq, mk: step.mk, macKey: step.macKey });
 
   const pt = packPlaintext(msgU8, state.PN, seq);
   const iv = crypto.getRandomValues(new Uint8Array(12));
@@ -510,6 +516,21 @@ async function tryRatchetDecrypt(state, slot) {
   }
 }
 
+// ─── Ratchet-op serializer ───────────────────────────────────────────────────
+// async/await yields at every `await`, letting other queued microtasks/handlers
+// interleave. `tryRatchetDecrypt` (called per incoming slot) and
+// `encodeRatchetSlot` (called from sendMessage / burnConversation) both mutate
+// `ratchet` across multiple awaits, so without serialization a racing onmessage
+// can roll back legitimate sender mutations via its snapshot/restore catch path
+// and silently desync the chain with the peer. All ratchet-touching entry
+// points run through withRatchet to enforce one-at-a-time execution.
+let opQueue = Promise.resolve();
+function withRatchet(fn) {
+  const next = opQueue.then(fn, fn);
+  opQueue = next.catch(() => null);
+  return next;
+}
+
 // ─── Send queue + slot scheduler (Phase 3 anonymous broadcast room) ──────────
 // Real messages and handshakes are queued; the scheduler emits one 1024-byte
 // slot every SLOT_INTERVAL_MS regardless of whether anything is queued (random
@@ -550,7 +571,8 @@ async function init() {
   ws.onmessage = (event) => {
     if (!(event.data instanceof ArrayBuffer)) return;
     if (event.data.byteLength !== SLOT_SIZE) return;
-    handleSlot(new Uint8Array(event.data));
+    const slot = new Uint8Array(event.data);
+    withRatchet(() => handleSlot(slot));
   };
 
   ws.onerror = () => addSystem("⚠ connection error — check your network.");
@@ -627,11 +649,12 @@ async function dispatchRatchetMessage(bytes) {
     peerBurnedMACs = [];
     for (let i = 0; i < count; i++) {
       const off = 3 + i * BURN_ENTRY_SIZE;
-      const seq = dv.getUint16(off, false);
-      const macKey = bytes.subarray(off + 2, off + 2 + 32);
-      peerBurnedMACs.push({ seq, macKey: ab2b64(macKey) });
+      const seq = dv.getUint32(off, false);
+      const mk = bytes.subarray(off + 4, off + 4 + 32);
+      const macKey = bytes.subarray(off + 4 + 32, off + 4 + 64);
+      peerBurnedMACs.push({ seq, mk: ab2b64(mk), macKey: ab2b64(macKey) });
     }
-    lockConversation(`🔥 peer burned this conversation — ${count} MAC key${count === 1 ? "" : "s"} received. Transcript is now publicly forgeable.`);
+    lockConversation(`🔥 peer burned this conversation — ${count} (mk, macKey) pair${count === 1 ? "" : "s"} received. Transcript is now publicly decryptable and forgeable.`);
   }
 }
 
@@ -641,12 +664,21 @@ async function handleHandshakePlaintext(pt) {
   if (ratchet) return;
 
   if (intent === 0x00) {
-    // Peer is initiating with us. Reply, then bootstrap as responder (or as
-    // initiator on tie-break when we also initiated and have greater pubkey).
+    // Anti-hijack: if we already initiated (user pasted a peer pubkey), only
+    // accept incoming inits from that same peer (mutual-init case where they
+    // pasted *our* session pub and ran setRecipient too). An unsolicited 0x00
+    // from a third party who happens to know our session pub would otherwise
+    // silently take over the recipient field and we'd ratchet with the
+    // attacker instead of the intended peer.
+    if (iInitiated && !eqU8(senderSessionPub, recipientPubRaw)) {
+      return;
+    }
     const reply = concatU8(new Uint8Array([0x01]), mySessionPubRaw);
     const replySlot = await encodeHandshakeSlot(senderSessionPub, reply);
     sendQueue.push(replySlot);
 
+    // Simultaneous-init tie-break: greater pubkey becomes initiator (gets CKs
+    // ready); smaller pubkey waits for first message to bootstrap CKs.
     const amInitiator = iInitiated && cmpU8(mySessionPubRaw, senderSessionPub) > 0;
     recipientPubRaw = senderSessionPub;
     recipientPubB64 = ab2b64(senderSessionPub);
@@ -697,11 +729,28 @@ async function burnConversation() {
     addSystem("⚠ can't burn yet — no messages have been sent on this side. Send a message first, then try again.");
     return;
   }
-  if (!confirm(
+
+  const total = ratchet.burnedMACs.length;
+  const willPublish = Math.min(total, MAX_BURN_ENTRIES);
+  const willSkip = total - willPublish;
+
+  // Honest disclosure: burn publishes BOTH mk (AES-GCM key) and macKey (HMAC
+  // key) per message. That means anyone with the manifest can decrypt past
+  // ciphertexts AND forge new messages. Older messages beyond the per-slot
+  // cap remain non-deniable.
+  let warning =
     "Burn this conversation?\n\n" +
-    "This publishes the MAC keys of your sent messages. Anyone with the chat transcript can then forge fake messages that look like they came from you. The chat will be locked read-only.\n\n" +
-    "This is irreversible."
-  )) return;
+    "This publishes the encryption AND authentication keys of your sent messages. Consequences:\n\n" +
+    "• Anyone who saved past ciphertext from this room can now decrypt those messages.\n" +
+    "• Anyone can forge new messages that authenticate against this chain.\n" +
+    "• The chat will be locked read-only on both sides.\n\n";
+  if (willSkip > 0) {
+    warning += `Only your most recent ${willPublish} of ${total} sent messages will be made forgeable — older messages remain non-deniable.\n\n`;
+  } else {
+    warning += `All ${willPublish} of your sent messages will be covered.\n\n`;
+  }
+  warning += "This is irreversible.";
+  if (!confirm(warning)) return;
 
   const entries = ratchet.burnedMACs.slice(-MAX_BURN_ENTRIES);
   const inner = new Uint8Array(3 + entries.length * BURN_ENTRY_SIZE);
@@ -710,12 +759,14 @@ async function burnConversation() {
   dv.setUint16(1, entries.length, false);
   for (let i = 0; i < entries.length; i++) {
     const off = 3 + i * BURN_ENTRY_SIZE;
-    dv.setUint16(off, entries[i].seq, false);
-    inner.set(entries[i].macKey, off + 2);
+    dv.setUint32(off, entries[i].seq, false);
+    inner.set(entries[i].mk, off + 4);
+    inner.set(entries[i].macKey, off + 4 + 32);
   }
   const slot = await encodeRatchetSlot(ratchet, inner);
   sendQueue.push(slot);
-  lockConversation(`🔥 you burned this conversation — ${entries.length} of your MAC key${entries.length === 1 ? "" : "s"} queued for broadcast.`);
+  const tail = willSkip > 0 ? ` — ${willSkip} older message${willSkip === 1 ? "" : "s"} not covered.` : "";
+  lockConversation(`🔥 you burned this conversation — ${entries.length} (mk, macKey) pair${entries.length === 1 ? "" : "s"} queued for broadcast.${tail}`);
 }
 
 function lockConversation(reason) {
@@ -734,11 +785,12 @@ function exportManifest() {
   if (!ratchet) return;
   const mySent = (ratchet.burnedMACs || []).map(e => ({
     seq: e.seq,
+    mk:     typeof e.mk     === "string" ? e.mk     : ab2b64(e.mk),
     macKey: typeof e.macKey === "string" ? e.macKey : ab2b64(e.macKey),
   }));
   const manifest = {
     burnedAt: new Date().toISOString(),
-    note: "These MAC keys can be used to forge messages that authenticate against this conversation's HMAC chain. The transcript is no longer a reliable record of who said what.",
+    note: "Each entry's mk is the AES-GCM message key and macKey is the HMAC key. Publishing both means anyone holding past ciphertexts can decrypt them, and anyone can forge new messages that authenticate against this chain. The transcript is no longer a reliable record of who said what — by design.",
     mySent,
     peerSent: peerBurnedMACs,
   };
@@ -773,7 +825,7 @@ async function copyMyKey() {
 }
 
 document.getElementById("msgInput").addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey) sendMessage();
+  if (e.key === "Enter" && !e.shiftKey) withRatchet(sendMessage);
 });
 
 init();

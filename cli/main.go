@@ -58,8 +58,12 @@ const (
 	msgTypeChat = 0x01
 	msgTypeBurn = 0x02
 
-	burnEntrySize    = 34
-	maxBurnEntries   = (maxMsgLen - 3) / burnEntrySize // 27
+	// Each burn entry: 4B seq (uint32, widened from 16B to avoid wrap on long
+	// chains) + 32B mk (message key) + 32B macKey = 68B. Publishing both keys
+	// is what actually delivers transcript-forgeability — see Burn comment
+	// below for the security/FS trade-off.
+	burnEntrySize  = 68
+	maxBurnEntries = (maxMsgLen - 3) / burnEntrySize // 13
 )
 
 // ── Ratchet state ────────────────────────────────────────────────────────────
@@ -86,19 +90,34 @@ type Ratchet struct {
 	BurnedMACs []BurnedMAC
 }
 
+// BurnedMAC is misnamed for historical reasons — it now carries BOTH the
+// message key (mk, AES-GCM) and the HMAC key (macKey). Publishing only macKey
+// (the old design) didn't actually enable transcript forgery because the
+// AES-GCM auth tag — keyed by mk — kept rejecting any forged ciphertext. We
+// now publish both, which means: (a) anyone with the manifest can forge
+// arbitrary plaintexts that pass both auth layers; (b) any eavesdropper who
+// recorded past ciphertext can decrypt those messages. That FS regression for
+// burned messages is the OTR-style trade-off the burn feature exists for.
 type BurnedMAC struct {
 	Seq    int    `json:"seq"`
-	MacKey string `json:"macKey"` // base64
+	MK     string `json:"mk"`     // base64 32B AES-GCM key
+	MacKey string `json:"macKey"` // base64 32B HMAC key
 }
 
-// Contact holds a peer's identity and current ratchet state.
+// Contact holds a peer's identity and current ratchet state. The mutex guards
+// R / Burned / PeerBurnedMACs against concurrent access from the input goroutine
+// (sendChatMessage / burnConversation) and the read goroutine
+// (handleSlot → tryRatchetDecryptSlot). Without it, the ratchet's snapshot /
+// restore on trial-decrypt failure can silently roll back legitimate sender
+// mutations and desync the chain with the peer.
 type Contact struct {
 	ID             int
 	SessionKeyB64  string // peer's session pub (base64)
 	SessionPubRaw  []byte // 32B
 	R              *Ratchet
-	Burned         bool       // conversation burned (sent or received); no more sends
+	Burned         bool        // conversation burned (sent or received); no more sends
 	PeerBurnedMACs []BurnedMAC // mac keys peer published in their burn message
+	Mu             sync.Mutex  // guards R, Burned, PeerBurnedMACs
 }
 
 // ── Global state ─────────────────────────────────────────────────────────────
@@ -115,6 +134,13 @@ var (
 	contactsMu    sync.Mutex
 	nextContactID = 1
 	activeContact *Contact
+
+	// pendingInits counts outstanding /find calls whose 0x01 reply hasn't
+	// arrived yet. A 0x01 from anyone with our identity pub is otherwise
+	// indistinguishable from a real reply, so we refuse to bootstrap as
+	// initiator unless we have at least one /find in flight.
+	pendingInits   int
+	pendingInitsMu sync.Mutex
 
 	conn   *websocket.Conn
 	connMu sync.Mutex
@@ -429,7 +455,11 @@ func encodeRatchetSlot(r *Ratchet, msg []byte) ([]byte, error) {
 	r.CKs = nextCK
 	seq := r.Ns
 	r.Ns++
-	r.BurnedMACs = append(r.BurnedMACs, BurnedMAC{Seq: seq, MacKey: base64.StdEncoding.EncodeToString(macKey)})
+	r.BurnedMACs = append(r.BurnedMACs, BurnedMAC{
+		Seq:    seq,
+		MK:     base64.StdEncoding.EncodeToString(mk),
+		MacKey: base64.StdEncoding.EncodeToString(macKey),
+	})
 
 	pt, err := packPlaintext(msg, uint32(r.PN), uint32(seq))
 	if err != nil {
@@ -596,6 +626,9 @@ func broadcastHandshake(peerPubB64 string) error {
 	if err != nil {
 		return err
 	}
+	pendingInitsMu.Lock()
+	pendingInits++
+	pendingInitsMu.Unlock()
 	enqueueSlot(slot)
 	return nil
 }
@@ -625,14 +658,28 @@ func handleHandshakePlaintext(plaintext []byte) {
 		c = &Contact{ID: id, SessionKeyB64: senderPubB64, SessionPubRaw: append([]byte{}, senderPub...)}
 		contacts[id] = c
 	}
+	contactsMu.Unlock()
+
+	// Now serialize per-contact: if R is already set, drop; else bootstrap.
+	c.Mu.Lock()
 	if c.R != nil {
-		contactsMu.Unlock()
+		c.Mu.Unlock()
 		return
 	}
-	contactsMu.Unlock()
+	c.Mu.Unlock()
 
 	switch intent {
 	case 0x00:
+		// Mutual /find tie-break: if we also initiated, the greater-pubkey side
+		// becomes initiator so at least one end has CKs ready. Without this,
+		// both ends are responders and the chain deadlocks.
+		amInitiator := false
+		pendingInitsMu.Lock()
+		if pendingInits > 0 && bytes.Compare(sessionPubRaw, senderPub) > 0 {
+			amInitiator = true
+		}
+		pendingInitsMu.Unlock()
+
 		reply := append([]byte{0x01}, sessionPubRaw...)
 		replySlot, err := encodeHandshakeSlot(senderPub, reply)
 		if err != nil {
@@ -640,27 +687,73 @@ func handleHandshakePlaintext(plaintext []byte) {
 			return
 		}
 		enqueueSlot(replySlot)
-		r, err := ratchetInit(false, sessionPriv, senderPub)
+		r, err := ratchetInit(amInitiator, sessionPriv, senderPub)
 		if err != nil {
 			printLine("[⚠ ratchet init failed: " + err.Error() + "]")
 			return
 		}
-		contactsMu.Lock()
+		c.Mu.Lock()
+		if c.R != nil {
+			c.Mu.Unlock()
+			return
+		}
 		c.R = r
-		activeContact = c
-		contactsMu.Unlock()
-		printLine(fmt.Sprintf("[!] incoming handshake → contact #%d (now active)", c.ID))
+		c.Mu.Unlock()
+		announceNewContact(c, "[!] incoming handshake → contact #%d")
 	case 0x01:
+		// Anti-hijack: only accept 0x01 if we have a /find outstanding. Without
+		// this, anyone with our (publicly shared) identity pub could ship a fake
+		// reply and bootstrap a real ratchet with us.
+		pendingInitsMu.Lock()
+		if pendingInits <= 0 {
+			pendingInitsMu.Unlock()
+			return
+		}
+		pendingInits--
+		pendingInitsMu.Unlock()
+
 		r, err := ratchetInit(true, sessionPriv, senderPub)
 		if err != nil {
 			printLine("[⚠ ratchet init failed: " + err.Error() + "]")
 			return
 		}
-		contactsMu.Lock()
+		c.Mu.Lock()
+		if c.R != nil {
+			c.Mu.Unlock()
+			return
+		}
 		c.R = r
-		activeContact = c
+		c.Mu.Unlock()
+		announceNewContact(c, "[✓] handshake complete → contact #%d")
+	}
+}
+
+// announceNewContact promotes c to active only if no in-flight conversation
+// is already there; otherwise prints a hint to switch manually. Prevents the
+// auto-displace hijack where an incoming handshake yanks focus mid-chat.
+func announceNewContact(c *Contact, base string) {
+	contactsMu.Lock()
+	prev := activeContact
+	contactsMu.Unlock()
+
+	prevInChat := false
+	if prev != nil && prev != c {
+		prev.Mu.Lock()
+		prevInChat = prev.R != nil
+		prev.Mu.Unlock()
+	}
+
+	if !prevInChat {
+		contactsMu.Lock()
+		// Re-check that prev is still the active contact; if it changed under
+		// us, defer to whoever raced in.
+		if activeContact == prev {
+			activeContact = c
+		}
 		contactsMu.Unlock()
-		printLine(fmt.Sprintf("[✓] handshake complete → contact #%d (now active)", c.ID))
+		printLine(fmt.Sprintf(base+" (now active)", c.ID))
+	} else {
+		printLine(fmt.Sprintf(base+"  (use /chat %d to switch)", c.ID, c.ID))
 	}
 }
 
@@ -682,14 +775,22 @@ func handleSlot(slot []byte) {
 	contactsMu.Lock()
 	candidates := make([]*Contact, 0, len(contacts))
 	for _, c := range contacts {
-		if c.R != nil {
-			candidates = append(candidates, c)
-		}
+		candidates = append(candidates, c)
 	}
 	contactsMu.Unlock()
 
 	for _, c := range candidates {
-		if msg := tryRatchetDecryptSlot(c.R, slot); msg != nil {
+		// Each contact's ratchet is protected by c.Mu so the trial-decrypt's
+		// snapshot/restore can't race with concurrent sendChatMessage /
+		// burnConversation on the input goroutine.
+		c.Mu.Lock()
+		if c.R == nil {
+			c.Mu.Unlock()
+			continue
+		}
+		msg := tryRatchetDecryptSlot(c.R, slot)
+		c.Mu.Unlock()
+		if msg != nil {
 			dispatchRatchetMessage(c, msg)
 			return
 		}
@@ -717,29 +818,23 @@ func dispatchRatchetMessage(c *Contact, bytes []byte) {
 		entries := make([]BurnedMAC, 0, count)
 		for i := 0; i < int(count); i++ {
 			off := 3 + i*burnEntrySize
-			seq := binary.BigEndian.Uint16(bytes[off : off+2])
-			macKey := base64.StdEncoding.EncodeToString(bytes[off+2 : off+2+32])
-			entries = append(entries, BurnedMAC{Seq: int(seq), MacKey: macKey})
+			seq := binary.BigEndian.Uint32(bytes[off : off+4])
+			mk := base64.StdEncoding.EncodeToString(bytes[off+4 : off+4+32])
+			macKey := base64.StdEncoding.EncodeToString(bytes[off+4+32 : off+4+64])
+			entries = append(entries, BurnedMAC{Seq: int(seq), MK: mk, MacKey: macKey})
 		}
-		contactsMu.Lock()
+		c.Mu.Lock()
 		c.PeerBurnedMACs = entries
 		c.Burned = true
-		contactsMu.Unlock()
-		printLine(fmt.Sprintf("[🔥 #%d peer burned the conversation — %d mac key(s) received. Transcript now publicly forgeable. Read-only.]", c.ID, count))
+		c.Mu.Unlock()
+		printLine(fmt.Sprintf("[🔥 #%d peer burned the conversation — %d key(s) received. Transcript now publicly forgeable and decryptable. Read-only.]", c.ID, count))
 	}
 }
 
 func sendChatMessage(text string) {
-	if activeContact == nil {
+	c := activeContact
+	if c == nil {
 		fmt.Println("[no active contact — /find <pub> first]")
-		return
-	}
-	if activeContact.R == nil {
-		fmt.Println("[handshake not complete yet — wait for the peer to come online]")
-		return
-	}
-	if activeContact.Burned {
-		fmt.Println("[conversation burned — read-only]")
 		return
 	}
 	inner := append([]byte{msgTypeChat}, []byte(text)...)
@@ -747,82 +842,123 @@ func sendChatMessage(text string) {
 		fmt.Printf("[message too long: %d > %d bytes per slot — chunking not implemented]\n", len(inner), maxMsgLen-1)
 		return
 	}
-	slot, err := encodeRatchetSlot(activeContact.R, inner)
+	c.Mu.Lock()
+	if c.R == nil {
+		c.Mu.Unlock()
+		fmt.Println("[handshake not complete yet — wait for the peer to come online]")
+		return
+	}
+	if c.Burned {
+		c.Mu.Unlock()
+		fmt.Println("[conversation burned — read-only]")
+		return
+	}
+	slot, err := encodeRatchetSlot(c.R, inner)
+	c.Mu.Unlock()
 	if err != nil {
 		fmt.Println("[⚠ encrypt failed:", err, "]")
 		return
 	}
 	enqueueSlot(slot)
 	ts := time.Now().Format("15:04")
-	fmt.Printf("[%s] [me→#%d] %s\n", ts, activeContact.ID, text)
+	fmt.Printf("[%s] [me→#%d] %s\n", ts, c.ID, text)
 }
 
-// burnConversation publishes recent macKeys of the active contact's outgoing
-// chain. The chat is then locked. Local mac keys remain; manifest can be
-// exported via /manifest <path>.
+// burnConversation publishes mk + macKey for the active contact's most recent
+// outgoing messages and locks the chat. Each burn slot carries at most
+// maxBurnEntries entries (13 on the current wire format). Older messages on
+// the same DH chain are NOT covered by the published keys and remain
+// non-deniable; we warn the user when this happens.
 func burnConversation() {
-	if activeContact == nil {
+	c := activeContact
+	if c == nil {
 		fmt.Println("[no active contact]")
 		return
 	}
-	if activeContact.R == nil {
+	c.Mu.Lock()
+	if c.R == nil {
+		c.Mu.Unlock()
 		fmt.Println("[handshake not complete yet]")
 		return
 	}
-	if activeContact.Burned {
+	if c.Burned {
+		c.Mu.Unlock()
 		fmt.Println("[already burned]")
 		return
 	}
-	if activeContact.R.CKs == nil || len(activeContact.R.BurnedMACs) == 0 {
+	if c.R.CKs == nil || len(c.R.BurnedMACs) == 0 {
+		c.Mu.Unlock()
 		fmt.Println("[no sent messages to burn — send at least one chat message first]")
 		return
 	}
 
-	all := activeContact.R.BurnedMACs
+	all := c.R.BurnedMACs
+	total := len(all)
 	start := 0
-	if len(all) > maxBurnEntries {
-		start = len(all) - maxBurnEntries
+	if total > maxBurnEntries {
+		start = total - maxBurnEntries
 	}
 	entries := all[start:]
+	if total > maxBurnEntries {
+		fmt.Printf("[⚠ %d sent messages on this chain; only the most recent %d can fit in one burn slot — older messages remain non-deniable]\n", total, maxBurnEntries)
+	}
 
 	inner := make([]byte, 3+len(entries)*burnEntrySize)
 	inner[0] = msgTypeBurn
 	binary.BigEndian.PutUint16(inner[1:3], uint16(len(entries)))
 	for i, e := range entries {
 		off := 3 + i*burnEntrySize
-		binary.BigEndian.PutUint16(inner[off:off+2], uint16(e.Seq))
+		binary.BigEndian.PutUint32(inner[off:off+4], uint32(e.Seq))
+		mk, err := base64.StdEncoding.DecodeString(e.MK)
+		if err != nil || len(mk) != 32 {
+			c.Mu.Unlock()
+			fmt.Println("[⚠ stored mk malformed]")
+			return
+		}
 		macKey, err := base64.StdEncoding.DecodeString(e.MacKey)
 		if err != nil || len(macKey) != 32 {
+			c.Mu.Unlock()
 			fmt.Println("[⚠ stored mac key malformed]")
 			return
 		}
-		copy(inner[off+2:off+2+32], macKey)
+		copy(inner[off+4:off+4+32], mk)
+		copy(inner[off+4+32:off+4+64], macKey)
 	}
-	slot, err := encodeRatchetSlot(activeContact.R, inner)
+	slot, err := encodeRatchetSlot(c.R, inner)
 	if err != nil {
+		c.Mu.Unlock()
 		fmt.Println("[⚠ burn encrypt failed:", err, "]")
 		return
 	}
+	c.Burned = true
+	c.Mu.Unlock()
 	enqueueSlot(slot)
-	activeContact.Burned = true
-	fmt.Printf("[🔥 burn queued — %d of your mac keys will be published. Conversation is now read-only.]\n", len(entries))
+	fmt.Printf("[🔥 burn queued — %d (mk,macKey) pair(s) will be published. Anyone with the transcript can now decrypt and forge messages from this chain. Conversation is now read-only.]\n", len(entries))
 }
 
 func writeManifest(path string) {
-	if activeContact == nil || activeContact.R == nil {
+	c := activeContact
+	if c == nil {
 		fmt.Println("[no active conversation to export]")
 		return
 	}
-	mine := make([]BurnedMAC, 0, len(activeContact.R.BurnedMACs))
-	for _, e := range activeContact.R.BurnedMACs {
-		mine = append(mine, BurnedMAC{Seq: e.Seq, MacKey: e.MacKey})
+	c.Mu.Lock()
+	if c.R == nil {
+		c.Mu.Unlock()
+		fmt.Println("[no active conversation to export]")
+		return
 	}
+	mine := append([]BurnedMAC(nil), c.R.BurnedMACs...)
+	peer := append([]BurnedMAC(nil), c.PeerBurnedMACs...)
+	contactPub := c.SessionKeyB64
+	c.Mu.Unlock()
+
 	manifest := map[string]any{
 		"burnedAt": time.Now().UTC().Format(time.RFC3339),
-		"contact":  activeContact.SessionKeyB64,
-		"note":     "These MAC keys can forge messages authenticating against this conversation's HMAC chain. The transcript is no longer a reliable record.",
+		"contact":  contactPub,
+		"note":     "Each entry's mk is the AES-GCM message key and macKey is the HMAC key. Publishing both means anyone holding past ciphertexts can decrypt them, and anyone can forge new messages that authenticate against this chain. The transcript is no longer a reliable record of who said what — by design.",
 		"mySent":   mine,
-		"peerSent": activeContact.PeerBurnedMACs,
+		"peerSent": peer,
 	}
 	if path == "" {
 		path = fmt.Sprintf("tacenda-burn-%d.json", time.Now().Unix())
@@ -832,7 +968,7 @@ func writeManifest(path string) {
 		fmt.Println("[⚠ manifest write failed:", err, "]")
 		return
 	}
-	fmt.Printf("[manifest written: %s  (%d mine, %d peer)]\n", path, len(mine), len(activeContact.PeerBurnedMACs))
+	fmt.Printf("[manifest written: %s  (%d mine, %d peer)]\n", path, len(mine), len(peer))
 }
 
 // ── Slot scheduler + send queue ─────────────────────────────────────────────
